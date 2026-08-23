@@ -4,6 +4,38 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 
 fn main() {
+    let (input_path, output_path, gap_width) = parse_args();
+
+    let mut doc = Document::load(&input_path).expect("无法加载 PDF");
+    let pages = doc.get_pages();
+
+    println!("共 {} 页，准备裁剪中间空白（指定宽度 = {} pt）", pages.len(), gap_width);
+
+    // ---------- 第一遍：扫描每页内容，检测真实中间空白 ----------
+    let mut plans: Vec<PagePlan> = Vec::new();
+    for (page_num, &page_id) in pages.iter() {
+        if let Some(plan) = scan_page(&doc, *page_num, page_id) {
+            plans.push(plan);
+        }
+    }
+
+    // 实际移除宽度不超过所有页的最小空白宽度，保证每页输出宽度一致
+    let cut = compute_cut(&plans, gap_width);
+
+    // ---------- 第二遍：重建每页内容流 ----------
+    for plan in &plans {
+        rebuild_page(&mut doc, plan, cut);
+    }
+
+    // 压缩并保存
+    doc.compress();
+    doc.save(&output_path).expect("保存 PDF 失败");
+
+    println!("完成！输出文件: {}", output_path);
+}
+
+/// 解析命令行参数；数量或格式错误时打印用法并退出
+fn parse_args() -> (String, String, f32) {
     let args: Vec<String> = env::args().collect();
     if args.len() != 4 {
         eprintln!("用法: {} <输入.pdf> <输出.pdf> <中间空白宽度>", args[0]);
@@ -12,82 +44,81 @@ fn main() {
         eprintln!("  示例: {} input-dual.pdf output.pdf 80", args[0]);
         std::process::exit(1);
     }
-
-    let input_path = &args[1];
-    let output_path = &args[2];
     let gap_width: f32 = args[3].parse().expect("空白宽度必须是数字");
+    (args[1].clone(), args[2].clone(), gap_width)
+}
 
-    let mut doc = Document::load(input_path).expect("无法加载 PDF");
-    let pages = doc.get_pages();
+/// 单页裁剪计划（第一遍扫描产物）
+struct PagePlan {
+    page_num: u32,
+    page_id: ObjectId,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    gap: Option<(f32, f32)>,
+}
 
-    println!("共 {} 页，准备裁剪中间空白（指定宽度 = {} pt）", pages.len(), gap_width);
+/// 第一遍扫描单页；页对象/MediaBox/内容流失败时返回 None，
+/// 缺 Resources 时返回 gap=None 的正常计划（不打错误消息）
+fn scan_page(doc: &Document, page_num: u32, page_id: ObjectId) -> Option<PagePlan> {
+    let page_obj = doc.get_object(page_id).expect("获取页面对象失败");
+    let page_dict = match page_obj {
+        Object::Dictionary(d) => d,
+        _ => {
+            eprintln!("跳过第 {} 页：页面对象不是字典", page_num);
+            return None;
+        }
+    };
+    let mediabox = match get_mediabox(doc, page_dict, page_id) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("跳过第 {} 页：无法获取 MediaBox: {}", page_num, e);
+            return None;
+        }
+    };
+    let (x1, y1, x2, y2) = (mediabox[0], mediabox[1], mediabox[2], mediabox[3]);
 
-    // ---------- 第一遍：扫描每页内容，检测真实中间空白 ----------
-    struct PagePlan {
-        page_num: u32,
-        page_id: ObjectId,
-        x1: f32,
-        y1: f32,
-        x2: f32,
-        y2: f32,
-        gap: Option<(f32, f32)>,
-    }
-    let mut plans: Vec<PagePlan> = Vec::new();
-
-    for (page_num, &page_id) in pages.iter() {
-        let page_obj = doc.get_object(page_id).expect("获取页面对象失败");
-        let page_dict = match page_obj {
-            Object::Dictionary(d) => d.clone(),
-            _ => {
-                eprintln!("跳过第 {} 页：页面对象不是字典", page_num);
-                continue;
+    let gap = match (
+        doc.get_page_content(page_id),
+        page_resources_dict(doc, page_dict, page_id),
+    ) {
+        (Ok(content), Some(res)) => {
+            let mut walker = Walk::new(doc);
+            walker.walk(&content, Some(res), 0);
+            let g = detect_gap(&walker.intervals, x1, x2);
+            match g {
+                Some((l, r)) => println!(
+                    "第 {} 页：检测到中间空白 [{:.1}, {:.1}]（宽 {:.1} pt）",
+                    page_num,
+                    l,
+                    r,
+                    r - l
+                ),
+                None => println!("第 {} 页：未检测到明显空白，按页面对称处理", page_num),
             }
-        };
-        let mediabox = match get_mediabox(&doc, &page_dict, page_id) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("跳过第 {} 页：无法获取 MediaBox: {}", page_num, e);
-                continue;
-            }
-        };
-        let (x1, y1, x2, y2) = (mediabox[0], mediabox[1], mediabox[2], mediabox[3]);
+            g
+        }
+        (Err(e), _) => {
+            eprintln!("跳过第 {} 页：无法获取内容流: {}", page_num, e);
+            return None;
+        }
+        (Ok(_), None) => None,
+    };
 
-        let gap = match (doc.get_page_content(page_id), page_resources_dict(&doc, &page_dict)) {
-            (Ok(content), Some(res)) => {
-                let mut walker = Walk::new(&doc);
-                walker.walk(&content, Some(res), 0);
-                let g = detect_gap(&walker.intervals, x1, x2);
-                match g {
-                    Some((l, r)) => println!(
-                        "第 {} 页：检测到中间空白 [{:.1}, {:.1}]（宽 {:.1} pt）",
-                        page_num,
-                        l,
-                        r,
-                        r - l
-                    ),
-                    None => println!("第 {} 页：未检测到明显空白，按页面对称处理", page_num),
-                }
-                g
-            }
-            (Err(e), _) => {
-                eprintln!("跳过第 {} 页：无法获取内容流: {}", page_num, e);
-                continue;
-            }
-            (Ok(_), None) => None,
-        };
+    Some(PagePlan {
+        page_num,
+        page_id,
+        x1,
+        y1,
+        x2,
+        y2,
+        gap,
+    })
+}
 
-        plans.push(PagePlan {
-            page_num: *page_num,
-            page_id,
-            x1,
-            y1,
-            x2,
-            y2,
-            gap,
-        });
-    }
-
-    // 实际移除宽度不超过所有页的最小空白宽度，保证每页输出宽度一致
+/// 收敛实际移除宽度：不超过所有页最小空白宽度；cut<=1 时报错退出
+fn compute_cut(plans: &[PagePlan], gap_width: f32) -> f32 {
     let min_detected = plans
         .iter()
         .filter_map(|p| p.gap)
@@ -104,206 +135,254 @@ fn main() {
             min_detected, gap_width, cut
         );
     }
+    cut
+}
 
-    // ---------- 第二遍：重建每页内容流 ----------
-    for plan in &plans {
-        let PagePlan {
-            page_num,
-            page_id,
-            x1,
-            y1,
-            x2,
-            y2,
-            gap,
-        } = *plan;
-        let total_width = x2 - x1;
-        let height = y2 - y1;
+/// 第二遍重建单页内容流；页面宽度过小或获取失败时跳过
+fn rebuild_page(doc: &mut Document, plan: &PagePlan, cut: f32) {
+    let PagePlan {
+        page_num,
+        page_id,
+        x1,
+        y1,
+        x2,
+        y2,
+        gap,
+    } = *plan;
+    let total_width = x2 - x1;
 
-        if total_width <= cut {
-            eprintln!(
-                "  跳过：页面宽度 ({:.1}) 小于等于移除宽度 ({:.1})",
-                total_width, cut
-            );
-            continue;
-        }
-
-        // 移除区域：优先在检测到的真实空白内居中，否则退回页面对称
-        let (band_left, band_right) = match gap {
-            Some((l, r)) => {
-                let c = (l + r) / 2.0;
-                (c - cut / 2.0, c + cut / 2.0)
-            }
-            None => {
-                let s = x1 + (total_width - cut) / 2.0;
-                (s, s + cut)
-            }
-        };
-        let band_left = band_left.max(x1).min(x2);
-        let band_right = band_right.max(x1).min(x2);
-        let new_width = total_width - cut;
-
-        println!(
-            "  原宽: {:.1}, 新宽: {:.1}, 移除区域: [{:.1}, {:.1}]",
-            total_width, new_width, band_left, band_right
+    if total_width <= cut {
+        eprintln!(
+            "  跳过：页面宽度 ({:.1}) 小于等于移除宽度 ({:.1})",
+            total_width, cut
         );
+        return;
+    }
 
-        let page_obj = doc.get_object(page_id).expect("获取页面对象失败");
-        let page_dict = match page_obj {
-            Object::Dictionary(d) => d.clone(),
-            _ => continue,
-        };
-
-        // 获取原始页面内容流（已解码合并）
-        let original_content = match doc.get_page_content(page_id) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("  跳过：无法获取内容流: {}", e);
-                continue;
-            }
-        };
-
-        // 获取 Resources（字体、图片等）
-        let resources = match get_resources(&doc, &page_dict, page_id) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("  跳过：无法获取 Resources: {}", e);
-                continue;
-            }
-        };
-
-        // 创建 Form XObject（将原页面内容封装进去）
-        let form_name = format!("FormX{}", page_num);
-        let form_name_bytes = form_name.into_bytes();
-
-        let mut form_dict = dictionary! {
-            "Type" => "XObject",
-            "Subtype" => "Form",
-            "FormType" => 1,
-            "BBox" => vec![x1.into(), y1.into(), x2.into(), y2.into()],
-        };
-
-        // 将 Resources 复制到 Form XObject，确保字体等资源可用
-        if let Ok(res_dict) = resources.as_dict() {
-            form_dict.set("Resources", Object::Dictionary(res_dict.clone()));
+    // 移除区域：优先在检测到的真实空白内居中，否则退回页面对称
+    let (band_left, band_right) = match gap {
+        Some((l, r)) => {
+            let c = (l + r) / 2.0;
+            (c - cut / 2.0, c + cut / 2.0)
         }
-
-        let form_stream = Stream::new(form_dict, original_content);
-        let form_id = doc.add_object(form_stream);
-
-        // 确保页面有 Resources 对象，并在其中注册 XObject
-        let resources_id = match page_dict.get(b"Resources") {
-            Ok(Object::Reference(id)) => *id,
-            Ok(Object::Dictionary(d)) => {
-                // 内联字典 → 提取为独立对象
-                doc.add_object(Object::Dictionary(d.clone()))
-            }
-            _ => doc.add_object(Dictionary::new()),
-        };
-
-        // 更新页面对 Resources 的引用
-        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(page_id) {
-            d.set("Resources", Object::Reference(resources_id));
+        None => {
+            let s = x1 + (total_width - cut) / 2.0;
+            (s, s + cut)
         }
+    };
+    let band_left = band_left.max(x1).min(x2);
+    let band_right = band_right.max(x1).min(x2);
+    let new_width = total_width - cut;
 
-        // 在 Resources 中添加 XObject 条目
-        if let Ok(Object::Dictionary(res_dict)) = doc.get_object_mut(resources_id) {
-            let mut xobjects = match res_dict.get(b"XObject") {
-                Ok(Object::Dictionary(xo)) => xo.clone(),
-                _ => Dictionary::new(),
-            };
-            xobjects.set(form_name_bytes.clone(), Object::Reference(form_id));
-            res_dict.set("XObject", Object::Dictionary(xobjects));
+    println!(
+        "  原宽: {:.1}, 新宽: {:.1}, 移除区域: [{:.1}, {:.1}]",
+        total_width, new_width, band_left, band_right
+    );
+
+    let page_obj = doc.get_object(page_id).expect("获取页面对象失败");
+    let page_dict = match page_obj {
+        Object::Dictionary(d) => d.clone(),
+        _ => return,
+    };
+
+    // 获取原始页面内容流（已解码合并）
+    let original_content = match doc.get_page_content(page_id) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  跳过：无法获取内容流: {}", e);
+            return;
         }
+    };
 
-        // 构建新的内容流：
-        // 注意裁剪矩形必须在 cm 之前定义（新页面坐标系），否则会随平移一起偏移
-        let new_content = Content {
-            operations: vec![
-                // ===== 左半边：保留 [x1, band_left] =====
-                Operation::new("q", vec![]),
-                Operation::new("re", vec![
-                    x1.into(),
-                    y1.into(),
-                    (band_left - x1).into(),
-                    height.into()
-                ]),
-                Operation::new("W", vec![]),
-                Operation::new("n", vec![]),
-                Operation::new("Do", vec![Object::Name(form_name_bytes.clone())]),
-                Operation::new("Q", vec![]),
+    // 获取 Resources（字体、图片等）
+    let resources = match get_resources(doc, &page_dict, page_id) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  跳过：无法获取 Resources: {}", e);
+            return;
+        }
+    };
 
-                // ===== 右半边：保留 [band_right, x2]，整体左移 cut =====
-                Operation::new("q", vec![]),
-                Operation::new("re", vec![
-                    band_left.into(),
-                    y1.into(),
-                    (x2 - cut - band_left).into(),
-                    height.into()
-                ]),
-                Operation::new("W", vec![]),
-                Operation::new("n", vec![]),
-                Operation::new("cm", vec![
-                    1.0.into(),
-                    0.0.into(),
-                    0.0.into(),
-                    1.0.into(),
-                    (-cut).into(),
-                    0.0.into()
-                ]),
-                Operation::new("Do", vec![Object::Name(form_name_bytes)]),
-                Operation::new("Q", vec![]),
-            ],
+    // 创建 Form XObject（将原页面内容封装进去）并注册进页面 Resources
+    let form_name = format!("FormX{}", page_num);
+    let form_name_bytes = form_name.into_bytes();
+    let form_stream = build_form_stream(x1, y1, x2, y2, &resources, original_content);
+    let form_id = doc.add_object(form_stream);
+    register_form_xobject(doc, &page_dict, page_id, &form_name_bytes, form_id);
+
+    // 构建新的内容流
+    let new_content = build_crop_content(x1, y1, x2, y2, band_left, cut, &form_name_bytes);
+    let new_content_stream = Stream::new(dictionary! {}, new_content.encode().unwrap());
+    let new_content_id = doc.add_object(new_content_stream);
+
+    // 更新页面字典：替换 Contents、MediaBox、CropBox
+    update_page_boxes(doc, page_id, new_content_id, x1, y1, x2, y2, cut);
+}
+
+/// 构建封装原页面内容的 Form XObject 流（BBox = 原页面框，Resources 从页复制）
+fn build_form_stream(
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    resources: &Object,
+    content: Vec<u8>,
+) -> Stream {
+    let mut form_dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Form",
+        "FormType" => 1,
+        "BBox" => vec![x1.into(), y1.into(), x2.into(), y2.into()],
+    };
+    // 将 Resources 复制到 Form XObject，确保字体等资源可用
+    if let Ok(res_dict) = resources.as_dict() {
+        form_dict.set("Resources", Object::Dictionary(res_dict.clone()));
+    }
+    Stream::new(form_dict, content)
+}
+
+/// 将 Form XObject 注册进页面 /Resources /XObject（内联字典提取为独立对象）
+fn register_form_xobject(
+    doc: &mut Document,
+    page_dict: &Dictionary,
+    page_id: ObjectId,
+    form_name: &[u8],
+    form_id: ObjectId,
+) {
+    // 确保页面有 Resources 对象
+    let resources_id = match page_dict.get(b"Resources") {
+        Ok(Object::Reference(id)) => *id,
+        Ok(Object::Dictionary(d)) => {
+            // 内联字典 → 提取为独立对象
+            doc.add_object(Object::Dictionary(d.clone()))
+        }
+        _ => doc.add_object(Dictionary::new()),
+    };
+
+    // 更新页面对 Resources 的引用
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(page_id) {
+        d.set("Resources", Object::Reference(resources_id));
+    }
+
+    // 在 Resources 中添加 XObject 条目
+    if let Ok(Object::Dictionary(res_dict)) = doc.get_object_mut(resources_id) {
+        let mut xobjects = match res_dict.get(b"XObject") {
+            Ok(Object::Dictionary(xo)) => xo.clone(),
+            _ => Dictionary::new(),
         };
+        xobjects.set(form_name.to_vec(), Object::Reference(form_id));
+        res_dict.set("XObject", Object::Dictionary(xobjects));
+    }
+}
 
-        let new_content_stream = Stream::new(dictionary! {}, new_content.encode().unwrap());
-        let new_content_id = doc.add_object(new_content_stream);
+/// 构建新页面内容流：左半保留 [x1, band_left]，右半保留并整体左移 cut。
+/// 注意裁剪矩形必须在 cm 之前定义（新页面坐标系），否则会随平移一起偏移
+fn build_crop_content(
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    band_left: f32,
+    cut: f32,
+    form_name: &[u8],
+) -> Content {
+    let height = y2 - y1;
+    Content {
+        operations: vec![
+            // ===== 左半边：保留 [x1, band_left] =====
+            Operation::new("q", vec![]),
+            Operation::new("re", vec![
+                x1.into(),
+                y1.into(),
+                (band_left - x1).into(),
+                height.into()
+            ]),
+            Operation::new("W", vec![]),
+            Operation::new("n", vec![]),
+            Operation::new("Do", vec![Object::Name(form_name.to_vec())]),
+            Operation::new("Q", vec![]),
 
-        // 更新页面字典：替换 Contents、MediaBox、CropBox
-        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(page_id) {
-            d.set("Contents", Object::Reference(new_content_id));
-            d.set("MediaBox", Object::Array(vec![
+            // ===== 右半边：保留 [band_right, x2]，整体左移 cut =====
+            Operation::new("q", vec![]),
+            Operation::new("re", vec![
+                band_left.into(),
+                y1.into(),
+                (x2 - cut - band_left).into(),
+                height.into()
+            ]),
+            Operation::new("W", vec![]),
+            Operation::new("n", vec![]),
+            Operation::new("cm", vec![
+                1.0.into(),
+                0.0.into(),
+                0.0.into(),
+                1.0.into(),
+                (-cut).into(),
+                0.0.into()
+            ]),
+            Operation::new("Do", vec![Object::Name(form_name.to_vec())]),
+            Operation::new("Q", vec![]),
+        ],
+    }
+}
+
+/// 替换页面 Contents/MediaBox/CropBox（CropBox 仅当已存在），删除 TrimBox/BleedBox/ArtBox
+fn update_page_boxes(
+    doc: &mut Document,
+    page_id: ObjectId,
+    new_content_id: ObjectId,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    cut: f32,
+) {
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(page_id) {
+        d.set("Contents", Object::Reference(new_content_id));
+        d.set("MediaBox", Object::Array(vec![
+            x1.into(),
+            y1.into(),
+            (x2 - cut).into(),
+            y2.into()
+        ]));
+        if d.has(b"CropBox") {
+            d.set("CropBox", Object::Array(vec![
                 x1.into(),
                 y1.into(),
                 (x2 - cut).into(),
                 y2.into()
             ]));
-            if d.has(b"CropBox") {
-                d.set("CropBox", Object::Array(vec![
-                    x1.into(),
-                    y1.into(),
-                    (x2 - cut).into(),
-                    y2.into()
-                ]));
-            }
-            d.remove(b"TrimBox");
-            d.remove(b"BleedBox");
-            d.remove(b"ArtBox");
         }
+        d.remove(b"TrimBox");
+        d.remove(b"BleedBox");
+        d.remove(b"ArtBox");
     }
-
-    // 压缩并保存
-    doc.compress();
-    doc.save(output_path).expect("保存 PDF 失败");
-
-    println!("完成！输出文件: {}", output_path);
 }
 
-/// 获取页面的 MediaBox，优先从页面字典获取，否则从父 Pages 节点继承
+/// 获取条目：优先页面字典，否则从父 Pages 节点继承；父节点非字典时报 ObjectNotFound
+fn page_inherit<'a>(
+    doc: &'a Document,
+    page_dict: &'a Dictionary,
+    page_id: ObjectId,
+    key: &[u8],
+) -> Result<&'a Object, lopdf::Error> {
+    page_dict.get(key).or_else(|_| {
+        if let Ok(Object::Reference(parent_id)) = page_dict.get(b"Parent") {
+            if let Ok(Object::Dictionary(parent_dict)) = doc.get_object(*parent_id) {
+                return parent_dict.get(key);
+            }
+        }
+        Err(lopdf::Error::ObjectNotFound(page_id))
+    })
+}
+
+/// 获取页面的 MediaBox
 fn get_mediabox(
     doc: &Document,
     page_dict: &Dictionary,
     page_id: ObjectId,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let obj = page_dict.get(b"MediaBox").or_else(|_| {
-        // 尝试从父节点获取
-        if let Ok(Object::Reference(parent_id)) = page_dict.get(b"Parent") {
-            if let Ok(Object::Dictionary(parent_dict)) = doc.get_object(*parent_id) {
-                return parent_dict.get(b"MediaBox");
-            }
-        }
-        Err(lopdf::Error::ObjectNotFound(page_id))
-    })?;
-
+    let obj = page_inherit(doc, page_dict, page_id, b"MediaBox")?;
     let (_, resolved) = doc.dereference(obj)?;
     let arr = resolved.as_array()?;
 
@@ -316,21 +395,13 @@ fn get_mediabox(
         .collect()
 }
 
-/// 获取页面的 Resources，优先从页面字典获取，否则从父 Pages 节点继承
+/// 获取页面的 Resources
 fn get_resources(
     doc: &Document,
     page_dict: &Dictionary,
     page_id: ObjectId,
 ) -> Result<Object, Box<dyn std::error::Error>> {
-    let obj = page_dict.get(b"Resources").or_else(|_| {
-        if let Ok(Object::Reference(parent_id)) = page_dict.get(b"Parent") {
-            if let Ok(Object::Dictionary(parent_dict)) = doc.get_object(*parent_id) {
-                return parent_dict.get(b"Resources");
-            }
-        }
-        Err(lopdf::Error::ObjectNotFound(page_id))
-    })?;
-
+    let obj = page_inherit(doc, page_dict, page_id, b"Resources")?;
     Ok(doc.dereference(obj)?.1.clone())
 }
 
@@ -338,22 +409,15 @@ fn get_resources(
 fn page_resources_dict<'a>(
     doc: &'a Document,
     page_dict: &'a Dictionary,
+    page_id: ObjectId,
 ) -> Option<&'a Dictionary> {
-    let mut res_obj: Option<&'a Object> = page_dict.get(b"Resources").ok();
-    if res_obj.is_none() {
-        if let Ok(p) = page_dict.get(b"Parent") {
-            if let Ok(id) = p.as_reference() {
-                if let Ok(pd) = doc.get_object(id).and_then(|o| o.as_dict()) {
-                    res_obj = pd.get(b"Resources").ok();
-                }
-            }
-        }
-    }
-    res_obj.and_then(|o| match o {
-        Object::Dictionary(d) => Some(d),
-        Object::Reference(id) => doc.get_object(*id).ok().and_then(|o2| o2.as_dict().ok()),
-        _ => None,
-    })
+    page_inherit(doc, page_dict, page_id, b"Resources")
+        .ok()
+        .and_then(|o| match o {
+            Object::Dictionary(d) => Some(d),
+            Object::Reference(id) => doc.get_object(*id).ok().and_then(|o2| o2.as_dict().ok()),
+            _ => None,
+        })
 }
 
 /// Object 转 f32（兼容 Integer 和 Real）
@@ -372,6 +436,30 @@ fn obj_dict(o: &Object) -> Option<&Dictionary> {
         Object::Stream(s) => Some(&s.dict),
         _ => None,
     }
+}
+
+/// 取子字典：Ok(Dictionary) 或 Ok(Reference)→deref，其余 None
+fn sub_dict<'a>(doc: &'a Document, d: &'a Dictionary, key: &[u8]) -> Option<&'a Dictionary> {
+    match d.get(key) {
+        Ok(Object::Dictionary(dd)) => Some(dd),
+        Ok(Object::Reference(id)) => doc.get_object(*id).ok().and_then(|o| o.as_dict().ok()),
+        _ => None,
+    }
+}
+
+/// 查找 XObject：res→/XObject→name→对象；条目仅接受 Reference
+fn find_xobject<'a>(
+    doc: &'a Document,
+    res: &'a Dictionary,
+    name: &[u8],
+) -> Option<(ObjectId, &'a Object)> {
+    let xo = sub_dict(doc, res, b"XObject")?;
+    let entry = xo.get(name).ok()?;
+    let id = match entry {
+        Object::Reference(id) => *id,
+        _ => return None,
+    };
+    Some((id, doc.get_object(id).ok()?))
 }
 
 // ===================== 内容范围扫描 =====================
@@ -408,6 +496,11 @@ impl Mat {
         }
     }
 
+    /// 平移矩阵
+    fn translate(x: f32, y: f32) -> Mat {
+        Mat::of(1.0, 0.0, 0.0, 1.0, x, y)
+    }
+
     /// 先应用 m1 再应用 m2（p·m1·m2）
     fn mul(m1: Mat, m2: Mat) -> Mat {
         Mat::of(
@@ -423,6 +516,35 @@ impl Mat {
     fn x_of(&self, x: f32, y: f32) -> f32 {
         self.a * x + self.c * y + self.e
     }
+}
+
+/// 点集经矩阵投影后的 x 范围 (min, max)；调用方须保证点集非空
+fn x_extents(m: Mat, pts: &[(f32, f32)]) -> (f32, f32) {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for &(x, y) in pts {
+        let px = m.x_of(x, y);
+        min = min.min(px);
+        max = max.max(px);
+    }
+    (min, max)
+}
+
+/// 将 mark 之后产生的区间按 [bx0, bx1] 钳位；仅保留非空结果（a2 < b2）
+fn clip_intervals_to_bbox(
+    intervals: &mut Vec<(f32, f32)>,
+    mark: usize,
+    bx0: f32,
+    bx1: f32,
+) {
+    let mut kept: Vec<(f32, f32)> = Vec::new();
+    for (a, b) in intervals.drain(mark..) {
+        let (a2, b2) = (a.max(bx0), b.min(bx1));
+        if a2 < b2 {
+            kept.push((a2, b2));
+        }
+    }
+    intervals.extend(kept);
 }
 
 #[derive(Clone)]
@@ -484,44 +606,46 @@ fn nums_at(a: &[Object], count: usize) -> Option<Vec<f32>> {
     (0..count).map(|i| a.get(i).and_then(onum)).collect()
 }
 
-fn build_font_info(doc: &Document, d: &Dictionary) -> FontInfo {
-    let subtype = d.get(b"Subtype").ok().and_then(|o| o.as_name().ok());
-    match subtype {
-        Some(s) if s == b"Type0" || s == b"Type0C" => {
-            let mut widths: HashMap<u16, f32> = HashMap::new();
-            let mut dw = 1000.0f32;
-            let arr: Option<&Vec<Object>> = match d.get(b"DescendantFonts") {
-                Ok(Object::Array(a)) => Some(a),
-                Ok(Object::Reference(id)) => {
-                    doc.get_object(*id).ok().and_then(|o| o.as_array().ok())
-                }
-                _ => None,
-            };
-            if let Some(arr) = arr {
-                let cid = match arr.first() {
-                    Some(Object::Reference(id)) => {
-                        doc.get_object(*id).ok().and_then(|o| o.as_dict().ok())
-                    }
-                    Some(Object::Dictionary(dd)) => Some(dd),
-                    _ => None,
-                };
-                if let Some(cd) = cid {
-                    if let Ok(o) = cd.get(b"DW") {
-                        if let Some(v) = onum(o) {
-                            dw = v;
-                        }
-                    }
-                    if let Ok(w) = cd.get(b"W").and_then(|o| o.as_array()) {
-                        for sub in w {
-                            if let Ok(arr2) = sub.as_array() {
-                                parse_w_entry(arr2, &mut widths);
-                            }
-                        }
-                    }
+/// DescendantFonts 数组 → 首个 CIDFont 字典（两跳 deref）
+fn descendant_cid_font<'a>(
+    doc: &'a Document,
+    d: &'a Dictionary,
+) -> Option<&'a Dictionary> {
+    let arr: &Vec<Object> = match d.get(b"DescendantFonts") {
+        Ok(Object::Array(a)) => a,
+        Ok(Object::Reference(id)) => doc.get_object(*id).ok()?.as_array().ok()?,
+        _ => return None,
+    };
+    match arr.first()? {
+        Object::Reference(id) => doc.get_object(*id).ok()?.as_dict().ok(),
+        Object::Dictionary(dd) => Some(dd),
+        _ => None,
+    }
+}
+
+/// Type0/Type0C 复合字体宽度信息；缺 DescendantFonts 时返回空 Cid
+fn build_cid_font_info<'a>(doc: &'a Document, d: &'a Dictionary) -> FontInfo {
+    let mut widths: HashMap<u16, f32> = HashMap::new();
+    let mut dw = 1000.0f32;
+    if let Some(cd) = descendant_cid_font(doc, d) {
+        if let Some(v) = cd.get(b"DW").ok().and_then(onum) {
+            dw = v;
+        }
+        if let Ok(w) = cd.get(b"W").and_then(|o| o.as_array()) {
+            for sub in w {
+                if let Ok(arr2) = sub.as_array() {
+                    parse_w_entry(arr2, &mut widths);
                 }
             }
-            FontInfo::Cid { widths, dw }
         }
+    }
+    FontInfo::Cid { widths, dw }
+}
+
+fn build_font_info<'a>(doc: &'a Document, d: &'a Dictionary) -> FontInfo {
+    let subtype = d.get(b"Subtype").ok().and_then(|o| o.as_name().ok());
+    match subtype {
+        Some(s) if s == b"Type0" || s == b"Type0C" => build_cid_font_info(doc, d),
         _ => {
             let first = d
                 .get(b"FirstChar")
@@ -685,59 +809,9 @@ impl<'a> Tok<'a> {
                 }
                 b'\\' => {
                     self.pos += 1;
-                    match self.peek()? {
-                        b'n' => {
-                            out.push(b'\n');
-                            self.pos += 1;
-                        }
-                        b'r' => {
-                            out.push(b'\r');
-                            self.pos += 1;
-                        }
-                        b't' => {
-                            out.push(b'\t');
-                            self.pos += 1;
-                        }
-                        b'b' => {
-                            out.push(0x08);
-                            self.pos += 1;
-                        }
-                        b'f' => {
-                            out.push(0x0C);
-                            self.pos += 1;
-                        }
-                        b'(' | b')' | b'\\' => {
-                            out.push(self.peek()?);
-                            self.pos += 1;
-                        }
-                        b'\r' => {
-                            self.pos += 1;
-                            if self.peek() == Some(b'\n') {
-                                self.pos += 1;
-                            }
-                        }
-                        b'\n' => {
-                            self.pos += 1;
-                        }
-                        c if (b'0'..=b'7').contains(&c) => {
-                            let mut v: u32 = 0;
-                            let mut n = 0;
-                            while n < 3 {
-                                match self.peek() {
-                                    Some(d) if (b'0'..=b'7').contains(&d) => {
-                                        v = v * 8 + (d - b'0') as u32;
-                                        self.pos += 1;
-                                        n += 1;
-                                    }
-                                    _ => break,
-                                }
-                            }
-                            out.push(v as u8);
-                        }
-                        other => {
-                            out.push(other);
-                            self.pos += 1;
-                        }
+                    // None = 行续（\r / \n，消耗但不产生字节）
+                    if let Some(c) = self.parse_escape()? {
+                        out.push(c);
                     }
                 }
                 _ => {
@@ -747,6 +821,68 @@ impl<'a> Tok<'a> {
             }
         }
         None
+    }
+
+    /// 解析单个转义字符（pos 已在 '\\' 之后）：
+    /// 外层 None = 数据结束；内层 None = \r / \n 行续（消耗但不产生字节）
+    fn parse_escape(&mut self) -> Option<Option<u8>> {
+        let c = self.peek()?;
+        Some(match c {
+            b'n' => {
+                self.pos += 1;
+                Some(b'\n')
+            }
+            b'r' => {
+                self.pos += 1;
+                Some(b'\r')
+            }
+            b't' => {
+                self.pos += 1;
+                Some(b'\t')
+            }
+            b'b' => {
+                self.pos += 1;
+                Some(0x08)
+            }
+            b'f' => {
+                self.pos += 1;
+                Some(0x0C)
+            }
+            c @ (b'(' | b')' | b'\\') => {
+                self.pos += 1;
+                Some(c)
+            }
+            b'\r' => {
+                self.pos += 1;
+                if self.peek() == Some(b'\n') {
+                    self.pos += 1;
+                }
+                None
+            }
+            b'\n' => {
+                self.pos += 1;
+                None
+            }
+            c if (b'0'..=b'7').contains(&c) => {
+                let mut v: u32 = 0;
+                let mut n = 0;
+                while n < 3 {
+                    match self.peek() {
+                        Some(d) if (b'0'..=b'7').contains(&d) => {
+                            v = v * 8 + (d - b'0') as u32;
+                            self.pos += 1;
+                            n += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                Some(v as u8)
+            }
+            other => {
+                self.pos += 1;
+                Some(other)
+            }
+        })
     }
 
     fn parse_hex_string(&mut self) -> Option<Vec<u8>> {
@@ -811,32 +947,37 @@ impl<'a> Tok<'a> {
                     }
                 }
             }
-            b'[' => {
-                self.pos += 1;
-                let mut arr = Vec::new();
-                loop {
-                    self.skip_ws_comments();
-                    match self.peek() {
-                        None => return Parsed::Err,
-                        Some(b']') => {
-                            self.pos += 1;
-                            break;
-                        }
-                        _ => {}
-                    }
-                    match self.parse_val() {
-                        Parsed::Val(v) => arr.push(v),
-                        Parsed::Word(_) | Parsed::DictSkipped => {}
-                        Parsed::Err => return Parsed::Err,
-                    }
-                }
-                Parsed::Val(Val::Arr(arr))
-            }
+            b'[' => match self.parse_array() {
+                Some(arr) => Parsed::Val(Val::Arr(arr)),
+                None => Parsed::Err,
+            },
             b'+' | b'-' | b'.' | b'0'..=b'9' => match self.parse_num() {
                 Some(n) => Parsed::Val(Val::Num(n)),
                 None => Parsed::Err,
             },
             _ => Parsed::Word(self.read_word()),
+        }
+    }
+
+    /// 解析数组（含 '[' 消耗）；Word/DictSkipped 元素丢弃
+    fn parse_array(&mut self) -> Option<Vec<Val>> {
+        self.pos += 1; // '['
+        let mut arr = Vec::new();
+        loop {
+            self.skip_ws_comments();
+            match self.peek() {
+                None => return None,
+                Some(b']') => {
+                    self.pos += 1;
+                    return Some(arr);
+                }
+                _ => {}
+            }
+            match self.parse_val() {
+                Parsed::Val(v) => arr.push(v),
+                Parsed::Word(_) | Parsed::DictSkipped => {}
+                Parsed::Err => return None,
+            }
         }
     }
 
@@ -852,67 +993,76 @@ impl<'a> Tok<'a> {
                 }
                 _ => {}
             }
+            // 读取键（名称或裸词）
             if self.peek() == Some(b'/') {
                 self.pos += 1;
                 self.parse_name();
             } else {
                 self.read_word();
             }
-            self.skip_ws_comments();
-            match self.peek() {
-                Some(b'[') => {
-                    self.pos += 1;
-                    let mut depth = 1;
-                    while let Some(b) = self.peek() {
-                        self.pos += 1;
-                        if b == b'[' {
-                            depth += 1;
-                        }
-                        if b == b']' {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Some(b'(') => {
-                    let _ = self.parse_lit_string();
-                }
-                Some(b'<') => {
-                    if self.peek2() == Some(b'<') {
-                        self.pos += 2;
-                        if !self.skip_dict() {
-                            return false;
-                        }
-                    } else {
-                        let _ = self.parse_hex_string();
-                    }
-                }
-                Some(b) if b.is_ascii_digit() || b == b'+' || b == b'-' || b == b'.' => {
-                    let _ = self.parse_num();
-                    // 对象引用 "1 0 R"
-                    self.skip_ws_comments();
-                    if let Some(b) = self.peek() {
-                        if b.is_ascii_digit() || b == b'+' || b == b'-' || b == b'.' {
-                            let _ = self.parse_num();
-                            self.skip_ws_comments();
-                            if self.peek().map_or(false, |b| !is_ws(b) && !is_delim(b)) {
-                                self.read_word();
-                            }
-                        }
-                    }
-                }
-                Some(b'/') => {
-                    self.pos += 1;
-                    self.parse_name();
-                }
-                Some(_) => {
-                    self.read_word();
-                }
-                None => return false,
+            if !self.skip_value() {
+                return false;
             }
         }
+    }
+
+    /// 跳过字典中的一个值（含数组配平、字符串、嵌套字典、"n n R" 对象引用）；失败返回 false
+    fn skip_value(&mut self) -> bool {
+        self.skip_ws_comments();
+        match self.peek() {
+            Some(b'[') => {
+                self.pos += 1;
+                let mut depth = 1;
+                while let Some(b) = self.peek() {
+                    self.pos += 1;
+                    if b == b'[' {
+                        depth += 1;
+                    }
+                    if b == b']' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(b'(') => {
+                let _ = self.parse_lit_string();
+            }
+            Some(b'<') => {
+                if self.peek2() == Some(b'<') {
+                    self.pos += 2;
+                    if !self.skip_dict() {
+                        return false;
+                    }
+                } else {
+                    let _ = self.parse_hex_string();
+                }
+            }
+            Some(b) if b.is_ascii_digit() || b == b'+' || b == b'-' || b == b'.' => {
+                let _ = self.parse_num();
+                // 对象引用 "1 0 R"
+                self.skip_ws_comments();
+                if let Some(b) = self.peek() {
+                    if b.is_ascii_digit() || b == b'+' || b == b'-' || b == b'.' {
+                        let _ = self.parse_num();
+                        self.skip_ws_comments();
+                        if self.peek().map_or(false, |b| !is_ws(b) && !is_delim(b)) {
+                            self.read_word();
+                        }
+                    }
+                }
+            }
+            Some(b'/') => {
+                self.pos += 1;
+                self.parse_name();
+            }
+            Some(_) => {
+                self.read_word();
+            }
+            None => return false,
+        }
+        true
     }
 
     fn next_item(&mut self) -> Option<Item> {
@@ -934,11 +1084,44 @@ impl<'a> Tok<'a> {
             return false;
         }
         self.pos += 2;
+        let length = match self.inline_image_length() {
+            Some(l) => l,
+            None => return false,
+        };
+        self.skip_ws_comments();
+        if self.peek() != Some(b'I') {
+            return false;
+        }
+        if self.read_word() != b"ID" {
+            return false;
+        }
+        // ID 后跟一个 EOL
+        if self.peek() == Some(b'\r') {
+            self.pos += 1;
+            if self.peek() == Some(b'\n') {
+                self.pos += 1;
+            }
+        } else if self.peek() == Some(b'\n') {
+            self.pos += 1;
+        }
+        if self.pos + length > self.data.len() {
+            return false;
+        }
+        self.pos += length;
+        self.skip_ws_comments();
+        if self.peek() != Some(b'E') {
+            return false;
+        }
+        self.read_word() == b"EI"
+    }
+
+    /// 读内联图像 BI 字典（调用方已消耗 "<<"）并返回 /Length；缺 Length 或出错返回 None
+    fn inline_image_length(&mut self) -> Option<usize> {
         let mut length: Option<usize> = None;
         loop {
             self.skip_ws_comments();
             match self.peek() {
-                None => return false,
+                None => return None,
                 Some(b'>') if self.peek2() == Some(b'>') => {
                     self.pos += 2;
                     break;
@@ -960,35 +1143,7 @@ impl<'a> Tok<'a> {
                 let _ = self.parse_val();
             }
         }
-        self.skip_ws_comments();
-        if self.peek() != Some(b'I') {
-            return false;
-        }
-        if self.read_word() != b"ID" {
-            return false;
-        }
-        // ID 后跟一个 EOL
-        if self.peek() == Some(b'\r') {
-            self.pos += 1;
-            if self.peek() == Some(b'\n') {
-                self.pos += 1;
-            }
-        } else if self.peek() == Some(b'\n') {
-            self.pos += 1;
-        }
-        let l = match length {
-            Some(l) => l,
-            None => return false,
-        };
-        if self.pos + l > self.data.len() {
-            return false;
-        }
-        self.pos += l;
-        self.skip_ws_comments();
-        if self.peek() != Some(b'E') {
-            return false;
-        }
-        self.read_word() == b"EI"
+        length
     }
 }
 
@@ -1071,7 +1226,23 @@ impl<'a> Walk<'a> {
         resources: Option<&'a Dictionary>,
         depth: usize,
     ) {
-        use Val::*;
+        match op {
+            "q" | "Q" | "cm" => self.exec_state(op, args),
+            "re" | "m" | "l" | "c" | "v" | "y" | "S" | "s" | "f" | "F" | "f*" | "B"
+            | "B*" | "b" | "b*" | "W" | "W*" | "n" => self.exec_path(op, args),
+            "BT" | "ET" | "Tm" | "Td" | "TD" | "T*" | "TL" | "Tw" | "Tc" | "Tz" | "Tf"
+            | "Tj" | "TJ" | "'" | "\"" => self.exec_text(op, args, resources),
+            "Do" => {
+                if let Some(Val::Name(n)) = args.last() {
+                    self.draw_xobject(n, resources, depth);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 图形状态：q / Q / cm
+    fn exec_state(&mut self, op: &str, args: &[Val]) {
         match op {
             "q" => {
                 self.ctm_stack.push(self.ctm);
@@ -1098,6 +1269,13 @@ impl<'a> Walk<'a> {
                     self.ctm = Mat::mul(Mat::of(a, b, c, d, e, f), self.ctm);
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// 路径：re/m/l/c/v/y 构造，绘制操作汇总区间，W|W*|n 丢弃
+    fn exec_path(&mut self, op: &str, args: &[Val]) {
+        match op {
             "re" => {
                 if let (Some(x), Some(y), Some(w), Some(h)) = (
                     Self::num(args, 0),
@@ -1142,18 +1320,25 @@ impl<'a> Walk<'a> {
             }
             "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" => {
                 if !self.path.is_empty() {
-                    let mut min = f32::INFINITY;
-                    let mut max = f32::NEG_INFINITY;
-                    for &(x, y) in &self.path {
-                        let px = self.ctm.x_of(x, y);
-                        min = min.min(px);
-                        max = max.max(px);
-                    }
+                    let (min, max) = x_extents(self.ctm, &self.path);
                     self.intervals.push((min, max));
                 }
                 self.path.clear();
             }
             "W" | "W*" | "n" => self.path.clear(),
+            _ => {}
+        }
+    }
+
+    /// 文本：BT/ET、Tm/Td/TD/T*/TL/Tw/Tc/Tz、Tf/Tj/TJ/'/"
+    fn exec_text(
+        &mut self,
+        op: &str,
+        args: &[Val],
+        resources: Option<&'a Dictionary>,
+    ) {
+        use Val::*;
+        match op {
             "BT" => {
                 self.in_text = true;
                 self.tlm = Mat::I;
@@ -1179,7 +1364,7 @@ impl<'a> Walk<'a> {
                     return;
                 }
                 if let (Some(tx), Some(ty)) = (Self::num(args, 0), Self::num(args, 1)) {
-                    self.tlm = Mat::mul(Mat::of(1.0, 0.0, 0.0, 1.0, tx, ty), self.tlm);
+                    self.tlm = Mat::mul(Mat::translate(tx, ty), self.tlm);
                 }
             }
             "TD" => {
@@ -1188,15 +1373,14 @@ impl<'a> Walk<'a> {
                 }
                 if let (Some(tx), Some(ty)) = (Self::num(args, 0), Self::num(args, 1)) {
                     self.tl = -ty;
-                    self.tlm = Mat::mul(Mat::of(1.0, 0.0, 0.0, 1.0, tx, ty), self.tlm);
+                    self.tlm = Mat::mul(Mat::translate(tx, ty), self.tlm);
                 }
             }
             "T*" => {
                 if !self.in_text {
                     return;
                 }
-                self.tlm =
-                    Mat::mul(Mat::of(1.0, 0.0, 0.0, 1.0, 0.0, -self.tl), self.tlm);
+                self.tlm = Mat::mul(Mat::translate(0.0, -self.tl), self.tlm);
             }
             "TL" => self.tl = Self::num(args, 0).unwrap_or(0.0),
             "Tw" => self.tw = Self::num(args, 0).unwrap_or(0.0),
@@ -1218,26 +1402,14 @@ impl<'a> Walk<'a> {
             "TJ" => {
                 if self.in_text {
                     if let Some(Arr(items)) = args.last() {
-                        let mut adv = 0.0f32;
-                        for it in items {
-                            match it {
-                                Num(n) => adv += n / 1000.0 * self.tfs,
-                                Str(s) => adv += self.string_advance(s),
-                                _ => {}
-                            }
-                        }
-                        self.text_emit(adv);
+                        self.text_emit(self.tj_advance(items));
                     }
                 }
             }
             "'" => {
                 if self.in_text {
                     if let Some(Str(s)) = args.last() {
-                        self.tlm = Mat::mul(
-                            Mat::of(1.0, 0.0, 0.0, 1.0, 0.0, -self.tl),
-                            self.tlm,
-                        );
-                        self.text_show(s);
+                        self.text_next_line_show(s);
                     }
                 }
             }
@@ -1246,21 +1418,31 @@ impl<'a> Walk<'a> {
                     if let Some(Str(s)) = args.last() {
                         self.tw = Self::num(args, 0).unwrap_or(0.0);
                         self.tc = Self::num(args, 1).unwrap_or(0.0);
-                        self.tlm = Mat::mul(
-                            Mat::of(1.0, 0.0, 0.0, 1.0, 0.0, -self.tl),
-                            self.tlm,
-                        );
-                        self.text_show(s);
+                        self.text_next_line_show(s);
                     }
-                }
-            }
-            "Do" => {
-                if let Some(Name(n)) = args.last() {
-                    self.draw_xobject(n, resources, depth);
                 }
             }
             _ => {}
         }
+    }
+
+    /// TJ 数组的总 advance（Num 缩进 + Str 字宽）
+    fn tj_advance(&self, items: &[Val]) -> f32 {
+        let mut adv = 0.0f32;
+        for it in items {
+            match it {
+                Val::Num(n) => adv += n / 1000.0 * self.tfs,
+                Val::Str(s) => adv += self.string_advance(s),
+                _ => {}
+            }
+        }
+        adv
+    }
+
+    /// 移到下一行行首并显示字符串（' 与 " 共享）
+    fn text_next_line_show(&mut self, s: &[u8]) {
+        self.tlm = Mat::mul(Mat::translate(0.0, -self.tl), self.tlm);
+        self.text_show(s);
     }
 
     fn resolve_font(&mut self, name: &[u8], resources: Option<&'a Dictionary>) {
@@ -1268,15 +1450,9 @@ impl<'a> Walk<'a> {
             Some(r) => r,
             None => return,
         };
-        let fonts = match res.get(b"Font") {
-            Ok(Object::Dictionary(d)) => d,
-            Ok(Object::Reference(id)) => {
-                match self.doc.get_object(*id).and_then(|o| o.as_dict()) {
-                    Ok(d) => d,
-                    Err(_) => return,
-                }
-            }
-            _ => return,
+        let fonts = match sub_dict(self.doc, res, b"Font") {
+            Some(d) => d,
+            None => return,
         };
         let entry = match fonts.get(name) {
             Ok(o) => o,
@@ -1356,27 +1532,9 @@ impl<'a> Walk<'a> {
             Some(r) => r,
             None => return,
         };
-        let xo = match res.get(b"XObject") {
-            Ok(Object::Dictionary(d)) => d,
-            Ok(Object::Reference(id)) => {
-                match self.doc.get_object(*id).and_then(|o| o.as_dict()) {
-                    Ok(d) => d,
-                    Err(_) => return,
-                }
-            }
-            _ => return,
-        };
-        let entry = match xo.get(name) {
-            Ok(o) => o,
-            Err(_) => return,
-        };
-        let id = match entry {
-            Object::Reference(id) => *id,
-            _ => return,
-        };
-        let obj = match self.doc.get_object(id) {
-            Ok(o) => o,
-            Err(_) => return,
+        let (id, obj) = match find_xobject(self.doc, res, name) {
+            Some(x) => x,
+            None => return,
         };
         let d = match obj_dict(obj) {
             Some(d) => d,
@@ -1384,86 +1542,75 @@ impl<'a> Walk<'a> {
         };
         let subtype = d.get(b"Subtype").ok().and_then(|o| o.as_name().ok());
         match subtype {
-            Some(s) if s == b"Form" => {
-                if depth >= 8 || !self.seen_forms.insert(id) {
-                    return;
-                }
-                let matrix = Self::matrix_of(d, b"Matrix").unwrap_or(Mat::I);
-                let new_ctm = Mat::mul(matrix, self.ctm);
-                let bbox: Option<[f32; 4]> = d
-                    .get(b"BBox")
-                    .ok()
-                    .and_then(|o| o.as_array().ok())
-                    .and_then(|a| nums_at(a, 4))
-                    .and_then(|v| v.try_into().ok());
-                let form_res = d.get(b"Resources").ok().and_then(|o| match o {
-                    Object::Dictionary(dd) => Some(dd),
-                    Object::Reference(rid) => self
-                        .doc
-                        .get_object(*rid)
-                        .ok()
-                        .and_then(|o2| o2.as_dict().ok()),
-                    _ => None,
-                });
-                let data = match obj
-                    .as_stream()
-                    .ok()
-                    .and_then(|st| st.decompressed_content().ok())
-                {
-                    Some(data) => data,
-                    None => return,
-                };
-                // Form 拥有独立的图形状态，进入前保存、返回后恢复
-                let saved = (
-                    self.ctm,
-                    self.ctm_stack.len(),
-                    self.ts_stack.len(),
-                    (self.tfs, self.tw, self.tc, self.tz, self.tl, self.font),
-                );
-                let mark = self.intervals.len();
-                self.ctm = new_ctm;
-                self.walk(&data, form_res, depth + 1);
-                self.ctm = saved.0;
-                self.ctm_stack.truncate(saved.1);
-                self.ts_stack.truncate(saved.2);
-                (self.tfs, self.tw, self.tc, self.tz, self.tl, self.font) = saved.3;
-                self.in_text = false;
-                self.tlm = Mat::I;
-                // 将本 Form 产生的区间裁剪到 BBox 范围（渲染时同样按 BBox 裁剪）
-                if let Some(bb) = bbox {
-                    let xs = [
-                        new_ctm.x_of(bb[0], bb[1]),
-                        new_ctm.x_of(bb[2], bb[1]),
-                        new_ctm.x_of(bb[0], bb[3]),
-                        new_ctm.x_of(bb[2], bb[3]),
-                    ];
-                    let bx0 = xs.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let bx1 = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mut kept: Vec<(f32, f32)> = Vec::new();
-                    for (a, b) in self.intervals.drain(mark..) {
-                        let (a2, b2) = (a.max(bx0), b.min(bx1));
-                        if a2 < b2 {
-                            kept.push((a2, b2));
-                        }
-                    }
-                    self.intervals.extend(kept);
-                }
-            }
-            Some(s) if s == b"Image" => {
-                let img_matrix = Self::matrix_of(d, b"Matrix").unwrap_or(Mat::I);
-                let c = Mat::mul(img_matrix, self.ctm);
-                let xs = [
-                    c.x_of(0.0, 0.0),
-                    c.x_of(1.0, 0.0),
-                    c.x_of(0.0, 1.0),
-                    c.x_of(1.0, 1.0),
-                ];
-                let min = xs.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                self.intervals.push((min, max));
-            }
+            Some(s) if s == b"Form" => self.walk_form(id, obj, d, depth),
+            Some(s) if s == b"Image" => self.emit_image_extent(d),
             _ => {}
         }
+    }
+
+    /// Form XObject：深度/环检查 → 保存图形状态 → 递归 walk → 恢复 → 区间按 BBox 裁剪
+    fn walk_form(
+        &mut self,
+        id: ObjectId,
+        obj: &'a Object,
+        d: &'a Dictionary,
+        depth: usize,
+    ) {
+        if depth >= 8 || !self.seen_forms.insert(id) {
+            return;
+        }
+        let matrix = Self::matrix_of(d, b"Matrix").unwrap_or(Mat::I);
+        let new_ctm = Mat::mul(matrix, self.ctm);
+        let bbox: Option<[f32; 4]> = d
+            .get(b"BBox")
+            .ok()
+            .and_then(|o| o.as_array().ok())
+            .and_then(|a| nums_at(a, 4))
+            .and_then(|v| v.try_into().ok());
+        let form_res = sub_dict(self.doc, d, b"Resources");
+        let data = match obj
+            .as_stream()
+            .ok()
+            .and_then(|st| st.decompressed_content().ok())
+        {
+            Some(data) => data,
+            None => return,
+        };
+        // Form 拥有独立的图形状态，进入前保存、返回后恢复
+        let saved = (
+            self.ctm,
+            self.ctm_stack.len(),
+            self.ts_stack.len(),
+            (self.tfs, self.tw, self.tc, self.tz, self.tl, self.font),
+        );
+        let mark = self.intervals.len();
+        self.ctm = new_ctm;
+        self.walk(&data, form_res, depth + 1);
+        self.ctm = saved.0;
+        self.ctm_stack.truncate(saved.1);
+        self.ts_stack.truncate(saved.2);
+        (self.tfs, self.tw, self.tc, self.tz, self.tl, self.font) = saved.3;
+        self.in_text = false;
+        self.tlm = Mat::I;
+        // 将本 Form 产生的区间裁剪到 BBox 范围（渲染时同样按 BBox 裁剪）
+        if let Some(bb) = bbox {
+            let corners = [
+                (bb[0], bb[1]),
+                (bb[2], bb[1]),
+                (bb[0], bb[3]),
+                (bb[2], bb[3]),
+            ];
+            let (bx0, bx1) = x_extents(new_ctm, &corners);
+            clip_intervals_to_bbox(&mut self.intervals, mark, bx0, bx1);
+        }
+    }
+
+    /// Image XObject：单位正方形四角经 Matrix×CTM 后推入 x 区间
+    fn emit_image_extent(&mut self, d: &Dictionary) {
+        let img_matrix = Self::matrix_of(d, b"Matrix").unwrap_or(Mat::I);
+        let c = Mat::mul(img_matrix, self.ctm);
+        let (min, max) = x_extents(c, &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]);
+        self.intervals.push((min, max));
     }
 }
 
