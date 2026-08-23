@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目简介
 
-pdf-crop-dual 是 Rust 命令行工具：裁剪「双栏」PDF（左栏原文、右栏译文）中间的空白带，将右栏左移使两栏相接，输出宽度变窄的新 PDF。全部代码在 `src/main.rs`（单文件二进制，唯一依赖 lopdf 0.36）。代码注释和输出信息使用中文，修改时保持一致。
+pdf-crop-dual 是 Rust 命令行工具：裁剪「双栏」PDF（左栏原文、右栏译文）中间的空白带，将右栏左移使两栏相接，输出宽度变窄的新 PDF。代码分两部分：`src/lib.rs`（PDF 内容分析：对象访问、矩阵几何、字体宽度、内容流词法器与 `Walk` 遍历、`detect_gap`）与 `src/main.rs`（CLI 与两遍算法、页面重建），唯一依赖 lopdf 0.36。代码注释和输出信息使用中文，修改时保持一致。
 
 ## 构建与运行
 
@@ -27,9 +27,9 @@ gs -dNOPAUSE -dBATCH -sDEVICE=pgmraw -r72 -sOutputFile=/tmp/x-%d.pgm <file.pdf>
 
 逐页比较暗像素列（灰度 < 200）的 min/max：左栏范围应不变，右栏应整体左移 cut、左右缘不丢 1pt 以上。系统只有 gs，没有 pdftoppm。
 
-## 架构（src/main.rs，约 1640 行）
+## 架构（src/main.rs 约 360 行 + src/lib.rs 约 1285 行）
 
-`main()` 编排两遍算法：`parse_args` → 逐页 `scan_page`（第一遍）→ `compute_cut` → 逐页 `rebuild_page`（第二遍）→ 压缩保存。
+`main.rs` 的 `main()` 编排两遍算法：`parse_args` → 逐页 `scan_page`（第一遍）→ `compute_cut` → 逐页 `rebuild_page`（第二遍）→ 压缩保存。内容分析机制（`Walk`、词法器、字体宽度、`detect_gap`、对象访问助手）在 `lib.rs`，main 仅导入 `Walk`/`detect_gap`/`get_mediabox`/`get_resources`/`page_resources_dict`。
 
 **第一遍：空白检测（`scan_page`）**
 - 每页取合并内容流（`doc.get_page_content`）与 Resources，`Walk` 遍历内容流收集墨迹 x 区间
