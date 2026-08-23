@@ -27,21 +27,21 @@ gs -dNOPAUSE -dBATCH -sDEVICE=pgmraw -r72 -sOutputFile=/tmp/x-%d.pgm <file.pdf>
 
 逐页比较暗像素列（灰度 < 200）的 min/max：左栏范围应不变，右栏应整体左移 cut、左右缘不丢 1pt 以上。系统只有 gs，没有 pdftoppm。
 
-## 架构（src/main.rs，约 1500 行）
+## 架构（src/main.rs，约 1640 行）
 
-`main()` 实现两遍算法：
+`main()` 编排两遍算法：`parse_args` → 逐页 `scan_page`（第一遍）→ `compute_cut` → 逐页 `rebuild_page`（第二遍）→ 压缩保存。
 
-**第一遍：空白检测**
+**第一遍：空白检测（`scan_page`）**
 - 每页取合并内容流（`doc.get_page_content`）与 Resources，`Walk` 遍历内容流收集墨迹 x 区间
-- `Walk` 跟踪：q/Q 图形状态栈、CTM（`cm` 与 Form Matrix）、文本状态（BT/ET、Tm/Td/TD/T*、TL/Tf/Tw/Tc/Tz）、路径坐标（m/l/c/v/y，绘制操作 S/f/… 时汇总为区间，W/n 丢弃）、`Do`（Form XObject 递归进入并应用 BBox 裁剪；Image XObject 按单位正方形）
+- `Walk` 跟踪：q/Q 图形状态栈、CTM（`cm` 与 Form Matrix）、文本状态（BT/ET、Tm/Td/TD/T*、TL/Tf/Tw/Tc/Tz）、路径坐标（m/l/c/v/y，绘制操作 S/f/… 时汇总为区间，W/n 丢弃）、`Do`（Form XObject 递归进入并应用 BBox 裁剪；Image XObject 按单位正方形）。操作分派在 `Walk::exec`，按类别分为 `exec_state`/`exec_path`/`exec_text`；Form 递归在 `walk_form`
 - 文本宽度计算：Type1 用 `FirstChar`+`Widths`；CID(Type0) 用 DescendantFonts 下 CIDFont 的 `W` 数组+`DW`（支持 `[first w]`、`[first last w]`、`[first [w1...]]` 三种形式）；无宽度信息时回退 1em（过估是安全方向）
 - `detect_gap`：页面中线左侧区间的最大右缘 = 空白左界，右侧区间的最小左缘 = 空白右界；有内容横跨中线或空隙 < 10pt 判为无清晰空白；两侧各留 2pt 安全余量
 - 实际移除宽度 `cut = min(用户指定宽度, 所有页最小空白宽)`，保证所有输出页宽度一致
 
-**第二遍：内容重建**
-- 原页内容流封装为新 Form XObject（BBox = 原页面框，Resources 从页复制），注册进页面 `/Resources /XObject`
-- 新内容流：左半 `clip [x1, band_left]` + Do；右半 `clip [band_left, x2-cut]` + `cm(-cut)` + Do
-- 更新页面 `Contents`/`MediaBox`/`CropBox`（新宽 `x2-cut`），删除 `TrimBox`/`BleedBox`/`ArtBox`，最后 `doc.compress()` + `save`
+**第二遍：内容重建（`rebuild_page`）**
+- `build_form_stream` 将原页内容流封装为新 Form XObject（BBox = 原页面框，Resources 从页复制），`register_form_xobject` 注册进页面 `/Resources /XObject`
+- `build_crop_content` 构建新内容流：左半 `clip [x1, band_left]` + Do；右半 `clip [band_left, x2-cut]` + `cm(-cut)` + Do
+- `update_page_boxes` 更新页面 `Contents`/`MediaBox`/`CropBox`（新宽 `x2-cut`），删除 `TrimBox`/`BleedBox`/`ArtBox`，最后 `doc.compress()` + `save`
 - 移除带位置：检测到空白时居中于检测到的空白带；未检测到时退回页面对称（以页面中心为心）
 
 ## 关键不变量（历史 bug 根因，改动时务必保持）
