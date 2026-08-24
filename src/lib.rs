@@ -1,6 +1,7 @@
-//! PDF 内容分析库：对象访问、几何、字体宽度、内容流词法器与遍历、空白检测。
+//! PDF 内容分析库：对象访问、几何、字体宽度、内容流词法器与遍历、空白检测、内容重写。
 
-use lopdf::{Document, Dictionary, Object, ObjectId};
+use lopdf::content::{Content, Operation};
+use lopdf::{Document, Dictionary, Object, ObjectId, StringFormat};
 use std::collections::{HashMap, HashSet};
 
 /// 获取条目：优先页面字典，否则从父 Pages 节点继承；父节点非字典时报 ObjectNotFound
@@ -1282,4 +1283,839 @@ pub fn detect_gap(intervals: &[(f32, f32)], x1: f32, x2: f32) -> Option<(f32, f3
         return None;
     }
     Some((l, r))
+}
+
+// ===================== 页面级内容重写（格式保留式裁剪） =====================
+//
+// 将原页面内容流重写为「左侧原样、右侧物理左移 cut」的新内容流：内容只存在
+// 一份、原有 Form XObject 结构不变，避免「整页封装 Form + 裁剪绘制两次」造成
+// 的文本层重复（编辑工具中段落被拆块）。
+//
+// 分类规则（与 clip 方案渲染严格对齐）：
+//   墨迹右缘 < band_left        → 保留原位置
+//   墨迹左缘 > band_left + cut  → 整体左移 cut（右侧可见区在原始坐标中从
+//                                 band_left + cut 开始，与 clip 裁剪区一致）
+//   跨越移除带                  → 返回 None（调用方回退 clip 方案）
+
+/// 重写页面级内容流；遇到超出支持范围的语法返回 None
+pub fn rewrite_page<'a>(
+    doc: &'a Document,
+    content: &[u8],
+    res: Option<&'a Dictionary>,
+    band_left: f32,
+    cut: f32,
+) -> Option<Content> {
+    Rewriter::new(doc, res, band_left, cut).run(content)
+}
+
+struct Rewriter<'a> {
+    doc: &'a Document,
+    res: Option<&'a Dictionary>,
+    band_left: f32,
+    cut: f32,
+    out: Vec<Operation>,
+    // 图形状态（q/Q 保存恢复，含字体——Walk 未存字体，此处需存以保证 Q 后字宽正确）
+    ctm: Mat,
+    qstack: Vec<(Mat, f32, f32, f32, f32, f32, Option<ObjectId>)>,
+    tfs: f32,
+    tw: f32,
+    tc: f32,
+    tz: f32,
+    tl: f32,
+    font: Option<ObjectId>,
+    fonts: HashMap<ObjectId, FontInfo>,
+    // 文本状态：tlm = 行矩阵（行首），tm = 文本矩阵（当前字形位置，显示后前移）
+    in_text: bool,
+    tlm: Mat,
+    tm: Mat,
+    // 当前绝对位置已施加的移位（0 或 -cut），BT 时复位
+    last_side: Option<f32>,
+    block: Vec<Operation>,
+    // 路径累积：m/re 开始新子路径；首个 m/re 之前的构造操作无法归类，进 preamble
+    preamble: Vec<Operation>,
+    subpaths: Vec<Subpath>,
+    cur: Option<Subpath>,
+}
+
+struct Subpath {
+    pts: Vec<(f32, f32)>,
+    ops: Vec<Operation>,
+}
+
+impl<'a> Rewriter<'a> {
+    fn new(doc: &'a Document, res: Option<&'a Dictionary>, band_left: f32, cut: f32) -> Self {
+        Rewriter {
+            doc,
+            res,
+            band_left,
+            cut,
+            out: Vec::new(),
+            ctm: Mat::I,
+            qstack: Vec::new(),
+            tfs: 0.0,
+            tw: 0.0,
+            tc: 0.0,
+            tz: 100.0,
+            tl: 0.0,
+            font: None,
+            fonts: HashMap::new(),
+            in_text: false,
+            tlm: Mat::I,
+            tm: Mat::I,
+            last_side: None,
+            block: Vec::new(),
+            preamble: Vec::new(),
+            subpaths: Vec::new(),
+            cur: None,
+        }
+    }
+
+    fn run(&mut self, data: &[u8]) -> Option<Content> {
+        let mut tk = Tok { data, pos: 0 };
+        let mut operands: Vec<Val> = Vec::new();
+        loop {
+            match tk.next_item() {
+                Some(Item::Val(v)) => operands.push(v),
+                Some(Item::Op(op)) => {
+                    if op == "BI" {
+                        return None; // 内联图像不支持
+                    }
+                    if !self.exec(&op, &operands) {
+                        return None;
+                    }
+                    operands.clear();
+                }
+                None => break,
+            }
+        }
+        if self.in_text {
+            return None; // BT 未闭合
+        }
+        // 无绘制操作的残留路径构造不产生墨迹，原样通过
+        for o in self.preamble.drain(..) {
+            self.out.push(o);
+        }
+        for c in self.subpaths.drain(..) {
+            self.out.extend(c.ops);
+        }
+        if let Some(c) = self.cur.take() {
+            self.out.extend(c.ops);
+        }
+        Some(Content {
+            operations: std::mem::take(&mut self.out),
+        })
+    }
+
+    fn exec(&mut self, op: &str, args: &[Val]) -> bool {
+        if self.in_text {
+            // 文本块内：文本操作走定位修正；颜色/线条外观/平坦度/渲染模式/
+            // 标记内容等操作不影响文本 x 定位，原样入缓冲；其余（含 cm/q/Q）→ 回退
+            return match op {
+                "ET" | "Tm" | "Td" | "TD" | "T*" | "TL" | "Tw" | "Tc" | "Tz" | "Tf" | "Tj"
+                | "TJ" | "'" | "\"" => self.exec_text(op, args),
+                "g" | "G" | "rg" | "RG" | "k" | "K" | "sc" | "SC" | "scn" | "SCN" | "cs"
+                | "CS" | "gs" | "w" | "J" | "j" | "M" | "d" | "ri" | "i" | "Tr" | "Ts" | "MP"
+                | "BMC" | "EMC" => {
+                    self.block.push(self.op_from(op, args));
+                    true
+                }
+                _ => false,
+            };
+        }
+        match op {
+            "q" | "Q" | "cm" => self.exec_state(op, args),
+            "re" | "m" | "l" | "c" | "v" | "y" | "h" | "S" | "s" | "f" | "F" | "f*" | "B"
+            | "B*" | "b" | "b*" | "W" | "W*" | "n" => self.exec_path(op, args),
+            "BT" => {
+                self.in_text = true;
+                self.tlm = Mat::I;
+                self.tm = Mat::I;
+                self.last_side = None;
+                self.block.clear();
+                self.emit("BT", args);
+                true
+            }
+            "TL" | "Tw" | "Tc" | "Tz" | "Tf" => self.exec_text_state(op, args),
+            "Tm" | "Td" | "TD" | "T*" | "Tj" | "TJ" | "'" | "\"" => {
+                // 文本对象外的文本定位/显示操作不生效，原样通过
+                self.emit(op, args);
+                true
+            }
+            "Do" => self.exec_do(args),
+            "w" | "J" | "j" | "M" | "d" | "ri" | "i" | "gs" | "CS" | "cs" | "SC" | "sc" | "SCN"
+            | "scn" | "MP" | "BMC" | "EMC" => {
+                // 状态类与标记内容操作不产生墨迹，原样通过
+                self.emit(op, args);
+                true
+            }
+            _ => false, // 未知操作无法确定墨迹范围 → 回退
+        }
+    }
+
+    /// 设备 x 坐标所属侧：左侧 0.0 / 右侧 -cut；落在移除带内返回 None
+    fn side_of_x(&self, x: f32) -> Option<f32> {
+        if x < self.band_left {
+            Some(0.0)
+        } else if x > self.band_left + self.cut {
+            Some(-self.cut)
+        } else {
+            None
+        }
+    }
+
+    /// 设备空间左移 cut 对应的操作空间平移（退化矩阵返回 None）
+    fn shift_vec(&self) -> Option<(f32, f32)> {
+        let det = self.ctm.a * self.ctm.d - self.ctm.b * self.ctm.c;
+        if det.abs() < 1e-9 {
+            return None;
+        }
+        Some((-self.cut * self.ctm.d / det, self.cut * self.ctm.b / det))
+    }
+
+    /// 图形状态：q / Q / cm（文本块内调用方已拦截）
+    fn exec_state(&mut self, op: &str, args: &[Val]) -> bool {
+        match op {
+            "q" => {
+                self.qstack.push((
+                    self.ctm, self.tfs, self.tw, self.tc, self.tz, self.tl, self.font,
+                ));
+                self.emit(op, args);
+                true
+            }
+            "Q" => {
+                if let Some(s) = self.qstack.pop() {
+                    (self.ctm, self.tfs, self.tw, self.tc, self.tz, self.tl, self.font) = s;
+                }
+                self.emit(op, args);
+                true
+            }
+            "cm" => {
+                if let (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) = (
+                    Walk::num(args, 0),
+                    Walk::num(args, 1),
+                    Walk::num(args, 2),
+                    Walk::num(args, 3),
+                    Walk::num(args, 4),
+                    Walk::num(args, 5),
+                ) {
+                    self.ctm = Mat::mul(Mat::of(a, b, c, d, e, f), self.ctm);
+                }
+                self.emit(op, args);
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// 文本块内操作
+    fn exec_text(&mut self, op: &str, args: &[Val]) -> bool {
+        match op {
+            "ET" => {
+                self.out.extend(self.block.drain(..));
+                self.out.push(Operation::new("ET", vec![]));
+                self.in_text = false;
+                true
+            }
+            "Tm" => self.exec_tm(args),
+            "Td" | "TD" => self.exec_td(op, args),
+            "T*" => {
+                // T* = Td(0, -TL)；T* 无操作数不能携带修正，改发 Td
+                let w = match self.rel_move(0.0, -self.tl) {
+                    Some(w) => w,
+                    None => return false,
+                };
+                self.block
+                    .push(Operation::new("Td", vec![w.0.into(), (-self.tl + w.1).into()]));
+                true
+            }
+            "Tj" | "TJ" => {
+                if !self.ensure_block_position() {
+                    return false;
+                }
+                let adv = match (op, args.last()) {
+                    ("Tj", Some(Val::Str(s))) => Some(self.string_advance(s)),
+                    ("TJ", Some(Val::Arr(items))) => Some(self.tj_advance(items)),
+                    _ => None,
+                };
+                if let Some(a) = adv {
+                    if !self.check_and_advance(a) {
+                        return false;
+                    }
+                }
+                self.block.push(self.op_from(op, args));
+                true
+            }
+            "'" => {
+                let s = match args.last() {
+                    Some(Val::Str(s)) => s,
+                    _ => {
+                        self.block.push(self.op_from("'", args));
+                        return true;
+                    }
+                };
+                let w = match self.rel_move(0.0, -self.tl) {
+                    Some(w) => w,
+                    None => return false,
+                };
+                self.block
+                    .push(Operation::new("Td", vec![w.0.into(), (-self.tl + w.1).into()]));
+                let adv = self.string_advance(s);
+                if !self.check_and_advance(adv) {
+                    return false;
+                }
+                self.block.push(Operation::new("Tj", vec![str_obj(s)]));
+                true
+            }
+            "\"" => {
+                let (tw, tc, s) = match (Walk::num(args, 0), Walk::num(args, 1), args.get(2)) {
+                    (Some(tw), Some(tc), Some(Val::Str(s))) => (tw, tc, s),
+                    _ => return false,
+                };
+                self.tw = tw;
+                self.tc = tc;
+                let w = match self.rel_move(0.0, -self.tl) {
+                    Some(w) => w,
+                    None => return false,
+                };
+                self.block.push(Operation::new("Tw", vec![tw.into()]));
+                self.block.push(Operation::new("Tc", vec![tc.into()]));
+                self.block
+                    .push(Operation::new("Td", vec![w.0.into(), (-self.tl + w.1).into()]));
+                let adv = self.string_advance(s);
+                if !self.check_and_advance(adv) {
+                    return false;
+                }
+                self.block.push(Operation::new("Tj", vec![str_obj(s)]));
+                true
+            }
+            "TL" | "Tw" | "Tc" | "Tz" | "Tf" => self.exec_text_state(op, args),
+            _ => false,
+        }
+    }
+
+    /// Tm：设置绝对位置。文本原点 (e,f) 经 CTM 映射到设备 (e,f)·C+t，不受 Tm
+    /// 自身线性部分影响，故移位修正只取 CTM 逆：δ(e,f) = (s,0)·C⁻¹；
+    /// 发射位置的移位必须恰为 s_t（与前一位置无关）
+    fn exec_tm(&mut self, args: &[Val]) -> bool {
+        let (a, b, c, d, e, f) = match (
+            Walk::num(args, 0),
+            Walk::num(args, 1),
+            Walk::num(args, 2),
+            Walk::num(args, 3),
+            Walk::num(args, 4),
+            Walk::num(args, 5),
+        ) {
+            (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => (a, b, c, d, e, f),
+            _ => {
+                // 非法操作数：与 Walk 一致不更新状态，原样通过
+                self.block.push(self.op_from("Tm", args));
+                return true;
+            }
+        };
+        let new_tlm = Mat::of(a, b, c, d, e, f);
+        let ptm = Mat::mul(new_tlm, self.ctm);
+        let s_t = match self.side_of_x(ptm.e) {
+            Some(s) => s,
+            None => return false,
+        };
+        let (de, df) = if s_t == 0.0 {
+            (0.0, 0.0)
+        } else {
+            let det = self.ctm.a * self.ctm.d - self.ctm.b * self.ctm.c;
+            if det.abs() < 1e-9 {
+                return false;
+            }
+            (s_t * self.ctm.d / det, -s_t * self.ctm.b / det)
+        };
+        let mut op = self.op_from("Tm", args);
+        add_to_real(&mut op, 4, de);
+        add_to_real(&mut op, 5, df);
+        self.block.push(op);
+        self.tlm = new_tlm;
+        self.tm = new_tlm;
+        self.last_side = Some(s_t);
+        true
+    }
+
+    /// Td / TD：相对行移动（规范语义：偏移在文本坐标系中，不受 Tm 缩放影响）
+    fn exec_td(&mut self, op: &str, args: &[Val]) -> bool {
+        let (tx, ty) = match (Walk::num(args, 0), Walk::num(args, 1)) {
+            (Some(x), Some(y)) => (x, y),
+            _ => {
+                self.block.push(self.op_from(op, args));
+                return true;
+            }
+        };
+        if op == "TD" {
+            self.tl = -ty;
+        }
+        let w = match self.rel_move(tx, ty) {
+            Some(w) => w,
+            None => return false,
+        };
+        let mut opn = self.op_from(op, args);
+        add_to_real(&mut opn, 0, w.0);
+        add_to_real(&mut opn, 1, w.1);
+        self.block.push(opn);
+        true
+    }
+
+    /// 相对行移动（Td/TD/T* 共享）：(tx,ty) 在文本空间、经行矩阵线性部分缩放
+    /// （规范语义，与 Walk 的 mul(translate, tlm) 同口径）；判定新位置所属侧，
+    /// 返回文本空间修正偏移（使发射位置较真实位置多移 s_t - s_p）
+    fn rel_move(&mut self, tx: f32, ty: f32) -> Option<(f32, f32)> {
+        let new_tlm = Mat::of(
+            self.tlm.a,
+            self.tlm.b,
+            self.tlm.c,
+            self.tlm.d,
+            self.tlm.e + tx * self.tlm.a + ty * self.tlm.c,
+            self.tlm.f + tx * self.tlm.b + ty * self.tlm.d,
+        );
+        let ptm = Mat::mul(new_tlm, self.ctm);
+        let s_t = self.side_of_x(ptm.e)?;
+        let s_p = self.last_side.unwrap_or(0.0);
+        let delta = s_t - s_p;
+        let r = if delta == 0.0 {
+            (0.0, 0.0)
+        } else {
+            let det = ptm.a * ptm.d - ptm.b * ptm.c;
+            if det.abs() < 1e-9 {
+                return None;
+            }
+            (delta * ptm.d / det, -delta * ptm.b / det)
+        };
+        self.tlm = new_tlm;
+        self.tm = new_tlm;
+        self.last_side = Some(s_t);
+        Some(r)
+    }
+
+    /// 块内尚无 Tm/Td 且当前显示位置由 CTM 决定：若位置在右侧，合成 Tm 携带移位
+    fn ensure_block_position(&mut self) -> bool {
+        if self.last_side.is_some() {
+            return true;
+        }
+        let ptm = Mat::mul(self.tlm, self.ctm);
+        let s_t = match self.side_of_x(ptm.e) {
+            Some(s) => s,
+            None => return false,
+        };
+        if s_t < 0.0 {
+            let det = ptm.a * ptm.d - ptm.b * ptm.c;
+            if det.abs() < 1e-9 {
+                return false;
+            }
+            let (de, df) = (s_t * ptm.d / det, -s_t * ptm.b / det);
+            self.block.push(Operation::new(
+                "Tm",
+                vec![
+                    self.tlm.a.into(),
+                    self.tlm.b.into(),
+                    self.tlm.c.into(),
+                    self.tlm.d.into(),
+                    (self.tlm.e + de).into(),
+                    (self.tlm.f + df).into(),
+                ],
+            ));
+        }
+        self.last_side = Some(s_t);
+        true
+    }
+
+    /// 显示操作的范围校验 + 文本矩阵前移
+    fn check_and_advance(&mut self, adv: f32) -> bool {
+        let ptm = Mat::mul(self.tm, self.ctm);
+        let x0 = ptm.e;
+        let x1 = x0 + adv * ptm.a;
+        let (lo, hi) = (x0.min(x1), x0.max(x1));
+        if !(hi < self.band_left || lo > self.band_left + self.cut) {
+            return false;
+        }
+        if adv != 0.0 {
+            // 沿行方向前移（不影响行首 tlm）
+            self.tm = Mat::of(
+                self.tm.a,
+                self.tm.b,
+                self.tm.c,
+                self.tm.d,
+                self.tm.a * adv + self.tm.e,
+                self.tm.b * adv + self.tm.f,
+            );
+        }
+        true
+    }
+
+    /// TL/Tw/Tc/Tz/Tf：更新状态；块内入缓冲，块外直接通过
+    fn exec_text_state(&mut self, op: &str, args: &[Val]) -> bool {
+        match op {
+            "TL" => self.tl = Walk::num(args, 0).unwrap_or(0.0),
+            "Tw" => self.tw = Walk::num(args, 0).unwrap_or(0.0),
+            "Tc" => self.tc = Walk::num(args, 0).unwrap_or(0.0),
+            "Tz" => self.tz = Walk::num(args, 0).unwrap_or(100.0),
+            "Tf" => {
+                if let (Some(Val::Name(n)), Some(size)) = (args.first(), Walk::num(args, 1)) {
+                    self.tfs = size;
+                    self.resolve_font(n);
+                }
+            }
+            _ => return false,
+        }
+        if self.in_text {
+            self.block.push(self.op_from(op, args));
+        } else {
+            self.emit(op, args);
+        }
+        true
+    }
+
+    /// 路径：re/m/l/c/v/y 累积子路径，绘制/裁剪/结束操作时按子路径分类发射
+    fn exec_path(&mut self, op: &str, args: &[Val]) -> bool {
+        match op {
+            "re" => {
+                let opn = self.op_from("re", args);
+                if let (Some(x), Some(y), Some(w), Some(h)) = (
+                    Walk::num(args, 0),
+                    Walk::num(args, 1),
+                    Walk::num(args, 2),
+                    Walk::num(args, 3),
+                ) {
+                    self.start_subpath(
+                        vec![(x, y), (x + w, y), (x + w, y + h), (x, y + h)],
+                        opn,
+                    );
+                } else {
+                    self.preamble.push(opn);
+                }
+                true
+            }
+            "m" => {
+                let opn = self.op_from("m", args);
+                if let (Some(x), Some(y)) = (Walk::num(args, 0), Walk::num(args, 1)) {
+                    self.start_subpath(vec![(x, y)], opn);
+                } else {
+                    self.preamble.push(opn);
+                }
+                true
+            }
+            "l" | "c" | "v" | "y" => {
+                let opn = self.op_from(op, args);
+                let n = if op == "l" { 1 } else { if op == "c" { 3 } else { 2 } };
+                let pts: Vec<(f32, f32)> = (0..n)
+                    .map(|i| (Walk::num(args, i * 2), Walk::num(args, i * 2 + 1)))
+                    .filter_map(|(a, b)| a.zip(b).map(|(x, y)| (x, y)))
+                    .collect();
+                if let Some(c) = self.cur.as_mut() {
+                    c.pts.extend(pts);
+                    c.ops.push(opn);
+                } else {
+                    self.preamble.push(opn);
+                }
+                true
+            }
+            "h" => {
+                // 闭合子路径：不增加新点（闭合线段 x 范围必在已有点范围内）
+                let opn = self.op_from(op, args);
+                if let Some(c) = self.cur.as_mut() {
+                    c.ops.push(opn);
+                } else {
+                    self.preamble.push(opn);
+                }
+                true
+            }
+            "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "W" | "W*" | "n" => {
+                self.end_path(op, args)
+            }
+            _ => true,
+        }
+    }
+
+    fn start_subpath(&mut self, pts: Vec<(f32, f32)>, op: Operation) {
+        if let Some(c) = self.cur.take() {
+            self.subpaths.push(c);
+        }
+        self.cur = Some(Subpath {
+            pts,
+            ops: vec![op],
+        });
+    }
+
+    fn end_path(&mut self, op: &str, args: &[Val]) -> bool {
+        if let Some(c) = self.cur.take() {
+            self.subpaths.push(c);
+        }
+        let mut shift = false;
+        for sp in &self.subpaths {
+            if sp.pts.is_empty() {
+                continue;
+            }
+            let (lo, hi) = x_extents(self.ctm, &sp.pts);
+            if hi < self.band_left {
+                continue;
+            }
+            if lo > self.band_left + self.cut {
+                shift = true;
+                continue;
+            }
+            return false; // 子路径跨越移除带
+        }
+        let wv = match (shift, self.shift_vec()) {
+            (true, Some(w)) => w,
+            (true, None) => return false,
+            (false, _) => (0.0, 0.0),
+        };
+        for o in self.preamble.drain(..) {
+            self.out.push(o);
+        }
+        for sp in self.subpaths.drain(..) {
+            if shift && !sp.pts.is_empty() && x_extents(self.ctm, &sp.pts).0 > self.band_left + self.cut {
+                for mut o in sp.ops {
+                    shift_path_op(&mut o, wv);
+                    self.out.push(o);
+                }
+            } else {
+                self.out.extend(sp.ops);
+            }
+        }
+        self.emit(op, args);
+        true
+    }
+
+    /// Do：Form 用临时 Walk 量测真实墨迹范围（与空白检测同口径），Image 按单位正方形
+    fn exec_do(&mut self, args: &[Val]) -> bool {
+        let name = match args.last() {
+            Some(Val::Name(n)) => n.clone(),
+            _ => {
+                self.emit("Do", args);
+                return true;
+            }
+        };
+        let res = match self.res {
+            Some(r) => r,
+            None => {
+                self.emit("Do", args);
+                return true;
+            }
+        };
+        let (_, obj) = match find_xobject(self.doc, res, &name) {
+            Some(x) => x,
+            None => {
+                self.emit("Do", args);
+                return true;
+            }
+        };
+        let d = match obj_dict(obj) {
+            Some(d) => d,
+            None => {
+                self.emit("Do", args);
+                return true;
+            }
+        };
+        let subtype = d.get(b"Subtype").ok().and_then(|o| o.as_name().ok());
+        match subtype {
+            Some(s) if s == b"Form" => self.do_form(obj, d, args),
+            Some(s) if s == b"Image" => {
+                let matrix = Walk::matrix_of(d, b"Matrix").unwrap_or(Mat::I);
+                let c = Mat::mul(matrix, self.ctm);
+                let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)];
+                let (lo, hi) = x_extents(c, &corners);
+                self.emit_shifted(args, lo, hi)
+            }
+            _ => {
+                self.emit("Do", args);
+                true
+            }
+        }
+    }
+
+    fn do_form(&mut self, obj: &'a Object, d: &'a Dictionary, args: &[Val]) -> bool {
+        let matrix = Walk::matrix_of(d, b"Matrix").unwrap_or(Mat::I);
+        let combined = Mat::mul(matrix, self.ctm);
+        let data = match obj
+            .as_stream()
+            .ok()
+            .and_then(|st| st.decompressed_content().ok())
+        {
+            Some(data) => data,
+            None => {
+                self.emit("Do", args);
+                return true;
+            }
+        };
+        let form_res = sub_dict(self.doc, d, b"Resources");
+        // 以 Form 自身墨迹范围分类；文本状态与第一遍一致传入，保证度量口径相同
+        let mut w = Walk::new(self.doc);
+        w.ctm = combined;
+        w.tfs = self.tfs;
+        w.tw = self.tw;
+        w.tc = self.tc;
+        w.tz = self.tz;
+        w.tl = self.tl;
+        w.font = self.font;
+        w.walk(&data, form_res, 0);
+        if w.intervals.is_empty() {
+            // Form 无墨迹：无内容可移，原样通过
+            self.emit("Do", args);
+            return true;
+        }
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &(a, b) in &w.intervals {
+            lo = lo.min(a);
+            hi = hi.max(b);
+        }
+        self.emit_shifted(args, lo, hi)
+    }
+
+    /// 按设备 x 范围发射 Do：全左原样、全右包 q/cm/Q 移位、跨带回退
+    fn emit_shifted(&mut self, args: &[Val], lo: f32, hi: f32) -> bool {
+        let opn = self.op_from("Do", args);
+        if hi < self.band_left {
+            self.out.push(opn);
+            true
+        } else if lo > self.band_left + self.cut {
+            let wv = match self.shift_vec() {
+                Some(w) => w,
+                None => return false,
+            };
+            self.out.push(Operation::new("q", vec![]));
+            self.out.push(Operation::new(
+                "cm",
+                vec![
+                    1.0.into(),
+                    0.0.into(),
+                    0.0.into(),
+                    1.0.into(),
+                    wv.0.into(),
+                    wv.1.into(),
+                ],
+            ));
+            self.out.push(opn);
+            self.out.push(Operation::new("Q", vec![]));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 字体解析（与 Walk::resolve_font 相同）
+    fn resolve_font(&mut self, name: &[u8]) {
+        let res = match self.res {
+            Some(r) => r,
+            None => return,
+        };
+        let fonts = match sub_dict(self.doc, res, b"Font") {
+            Some(d) => d,
+            None => return,
+        };
+        let entry = match fonts.get(name) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        let id = match entry {
+            Object::Reference(id) => *id,
+            _ => return,
+        };
+        if self.fonts.contains_key(&id) {
+            self.font = Some(id);
+            return;
+        }
+        let obj = match self.doc.get_object(id) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        let d = match obj_dict(obj) {
+            Some(d) => d,
+            None => return,
+        };
+        let info = build_font_info(self.doc, d);
+        self.fonts.insert(id, info);
+        self.font = Some(id);
+    }
+
+    /// TJ 数组的总 advance（Num 缩进 + Str 字宽），与 Walk 相同
+    fn tj_advance(&self, items: &[Val]) -> f32 {
+        let mut adv = 0.0f32;
+        for it in items {
+            match it {
+                Val::Num(n) => adv += n / 1000.0 * self.tfs,
+                Val::Str(s) => adv += self.string_advance(s),
+                _ => {}
+            }
+        }
+        adv
+    }
+
+    /// 字符串 advance（与 Walk::string_advance 相同）
+    fn string_advance(&self, s: &[u8]) -> f32 {
+        let font = self.font.and_then(|id| self.fonts.get(&id));
+        let codes: Vec<u32> = match font {
+            Some(FontInfo::Cid { .. }) => s
+                .chunks(2)
+                .filter(|c| c.len() == 2)
+                .map(|c| ((c[0] as u32) << 8) | c[1] as u32)
+                .collect(),
+            _ => s.iter().map(|&b| b as u32).collect(),
+        };
+        let mut adv = 0.0f32;
+        for code in codes {
+            let w = font.map(|f| glyph_width(f, code)).unwrap_or(1000.0);
+            adv += w * self.tfs / 1000.0 + self.tc;
+            if code == 32 {
+                adv += self.tz / 100.0 * self.tw;
+            }
+        }
+        adv
+    }
+
+    fn op_from(&self, name: &str, args: &[Val]) -> Operation {
+        let operands: Vec<Object> = args.iter().map(val_to_obj).collect();
+        Operation::new(name, operands)
+    }
+
+    fn emit(&mut self, name: &str, args: &[Val]) {
+        self.out.push(self.op_from(name, args));
+    }
+}
+
+/// Val → lopdf Object（字符串用字面量形式，write_string 会自动转义）
+fn val_to_obj(v: &Val) -> Object {
+    match v {
+        Val::Num(n) => Object::Real(*n),
+        Val::Name(n) => Object::Name(n.clone()),
+        Val::Str(s) => Object::String(s.clone(), StringFormat::Literal),
+        Val::Arr(items) => Object::Array(items.iter().map(val_to_obj).collect()),
+    }
+}
+
+/// Val::Str 便捷构造
+fn str_obj(s: &[u8]) -> Object {
+    Object::String(s.to_vec(), StringFormat::Literal)
+}
+
+/// 将操作符第 idx 个数字操作数加上 delta（此处生成的操作数均为 Real）
+fn add_to_real(op: &mut Operation, idx: usize, delta: f32) {
+    if delta != 0.0 {
+        if let Some(Object::Real(v)) = op.operands.get_mut(idx) {
+            *v += delta;
+        }
+    }
+}
+
+/// 路径构造操作符的坐标按操作空间平移 (dx, dy)
+fn shift_path_op(op: &mut Operation, w: (f32, f32)) {
+    let idx: &[(usize, usize)] = match op.operator.as_str() {
+        "m" | "l" | "re" => &[(0, 1)],
+        "c" => &[(0, 1), (2, 3), (4, 5)],
+        "v" | "y" => &[(0, 1), (2, 3)],
+        _ => return,
+    };
+    for &(xi, yi) in idx {
+        if let Some(Object::Real(v)) = op.operands.get_mut(xi) {
+            *v += w.0;
+        }
+        if let Some(Object::Real(v)) = op.operands.get_mut(yi) {
+            *v += w.1;
+        }
+    }
 }

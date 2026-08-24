@@ -2,7 +2,9 @@ use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Dictionary, Object, ObjectId, Stream};
 use std::env;
 
-use pdf_crop_dual::{detect_gap, get_mediabox, get_resources, page_resources_dict, Walk};
+use pdf_crop_dual::{
+    detect_gap, get_mediabox, get_resources, page_resources_dict, rewrite_page, Walk,
+};
 
 fn main() {
     let (input_path, output_path, gap_width) = parse_args();
@@ -204,15 +206,29 @@ fn rebuild_page(doc: &mut Document, plan: &PagePlan, cut: f32) {
         }
     };
 
-    // 创建 Form XObject（将原页面内容封装进去）并注册进页面 Resources
-    let form_name = format!("FormX{}", page_num);
-    let form_name_bytes = form_name.into_bytes();
-    let form_stream = build_form_stream(x1, y1, x2, y2, &resources, original_content);
-    let form_id = doc.add_object(form_stream);
-    register_form_xobject(doc, &page_dict, page_id, &form_name_bytes, form_id);
+    // 检测到空白时优先直接重写内容流：左侧原样、右侧物理左移 cut，内容只存在
+    // 一份且保留原有 Form 结构（格式保留式裁剪）；不可重写时回退传统方案
+    let rewritten = if gap.is_some() {
+        let res_dict = page_resources_dict(doc, &page_dict, page_id);
+        rewrite_page(doc, &original_content, res_dict, band_left, cut)
+    } else {
+        None
+    };
 
-    // 构建新的内容流
-    let new_content = build_crop_content(x1, y1, x2, y2, band_left, cut, &form_name_bytes);
+    let new_content = match rewritten {
+        Some(content) => content,
+        None => {
+            // 创建 Form XObject（将原页面内容封装进去）并注册进页面 Resources
+            let form_name = format!("FormX{}", page_num);
+            let form_name_bytes = form_name.into_bytes();
+            let form_stream = build_form_stream(x1, y1, x2, y2, &resources, original_content);
+            let form_id = doc.add_object(form_stream);
+            register_form_xobject(doc, &page_dict, page_id, &form_name_bytes, form_id);
+
+            // 构建新的内容流
+            build_crop_content(x1, y1, x2, y2, band_left, cut, &form_name_bytes)
+        }
+    };
     let new_content_stream = Stream::new(dictionary! {}, new_content.encode().unwrap());
     let new_content_id = doc.add_object(new_content_stream);
 
