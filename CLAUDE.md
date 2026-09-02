@@ -41,8 +41,8 @@ gs -dNOPAUSE -dBATCH -sDEVICE=pgmraw -r72 -sOutputFile=/tmp/x-%d.pgm <file.pdf>
 
 **第一遍：空白检测（`scan_page`）**
 - 每页取合并内容流（`doc.get_page_content`）与 Resources，`Walk` 遍历内容流收集墨迹 x 区间
-- `Walk` 跟踪：q/Q 图形状态栈、CTM（`cm` 与 Form Matrix）、文本状态（BT/ET、Tm/Td/TD/T*、TL/Tf/Tw/Tc/Tz）、路径坐标（m/l/c/v/y，绘制操作 S/f/… 时汇总为区间，W/n 丢弃）、`Do`（Form XObject 递归进入并应用 BBox 裁剪；Image XObject 按单位正方形）。操作分派在 `Walk::exec`，按类别分为 `exec_state`/`exec_path`/`exec_text`；Form 递归在 `walk_form`
-- 文本宽度计算：Type1 用 `FirstChar`+`Widths`；CID(Type0) 用 DescendantFonts 下 CIDFont 的 `W` 数组+`DW`（支持 `[first w]`、`[first last w]`、`[first [w1...]]` 三种形式）；无宽度信息时回退 1em（过估是安全方向）
+- `Walk` 跟踪：q/Q 图形状态栈、CTM（`cm` 与 Form Matrix）、文本状态（BT/ET、Tm/Td/TD/T*、TL/Tf/Tw/Tc/Tz）、路径坐标（m/l/c/v/y，绘制操作 S/f/… 时汇总为区间，W/n 丢弃）、`Do`（Form XObject 递归进入并应用 BBox 裁剪；Image XObject 按单位正方形）。操作分派在 `Walk::exec`，按类别分为 `exec_state`/`exec_path`/`exec_text`（文本再按定位/显示分派到 `exec_text_move`/`exec_text_show`）；Form 递归在 `walk_form`
+- 文本宽度计算：Type1 用 `FirstChar`+`Widths`；CID(Type0) 用 DescendantFonts 下 CIDFont 的 `W` 数组+`DW`（支持 `[first w]`、`[first last w]`、`[first [w1...]]` 三种形式）；无宽度信息时回退 1em（过估是安全方向）。advance 计算（`str_advance`/`tj_advance`）与字体解析（`resolve_font_id`）是 `Walk` 与重写器共用的自由函数（口径单点实现），两侧只保留同名薄封装
 - `detect_gap`：页面中线左侧区间的最大右缘 = 空白左界，右侧区间的最小左缘 = 空白右界；有内容横跨中线或空隙 < 10pt 判为无清晰空白；两侧各留 2pt 安全余量
 - 实际移除宽度 `cut = min(用户指定宽度, 所有页最小空白宽)`，保证所有输出页宽度一致
 
