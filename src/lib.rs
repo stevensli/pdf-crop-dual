@@ -313,6 +313,31 @@ fn build_font_info<'a>(doc: &'a Document, d: &'a Dictionary) -> FontInfo {
     }
 }
 
+/// 在 Resources 的 /Font 子字典中按名查找字体对象 id（条目须为间接引用）
+fn font_object_id(doc: &Document, res: Option<&Dictionary>, name: &[u8]) -> Option<ObjectId> {
+    let res = res?;
+    let fonts = sub_dict(doc, res, b"Font")?;
+    match fonts.get(name).ok()? {
+        Object::Reference(id) => Some(*id),
+        _ => None,
+    }
+}
+
+/// 解析字体名：查 /Font 子字典，FontInfo 缺失时构建并入缓存；成功返回字体 id
+fn resolve_font_id(
+    doc: &Document,
+    res: Option<&Dictionary>,
+    name: &[u8],
+    fonts: &mut HashMap<ObjectId, FontInfo>,
+) -> Option<ObjectId> {
+    let id = font_object_id(doc, res, name)?;
+    if !fonts.contains_key(&id) {
+        let d = doc.get_object(id).ok().and_then(obj_dict)?;
+        fonts.insert(id, build_font_info(doc, d));
+    }
+    Some(id)
+}
+
 // ===================== 内容流词法分析 =====================
 
 #[derive(Debug)]
@@ -792,6 +817,50 @@ impl<'a> Tok<'a> {
     }
 }
 
+// ===================== 文本 advance（Walk 与 Rewriter 共用，保证口径单点实现） =====================
+
+/// 字符串 advance：逐码字宽 + 字距 Tc；空格额外加 Tz/100·Tw。
+/// CID 字体按 2 字节解码，其余按 1 字节；无字体信息按 1em（过估是安全方向）
+fn str_advance(font: Option<&FontInfo>, s: &[u8], tfs: f32, tw: f32, tc: f32, tz: f32) -> f32 {
+    let codes: Vec<u32> = match font {
+        Some(FontInfo::Cid { .. }) => s
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| ((c[0] as u32) << 8) | c[1] as u32)
+            .collect(),
+        _ => s.iter().map(|&b| b as u32).collect(),
+    };
+    let mut adv = 0.0f32;
+    for code in codes {
+        let w = font.map(|f| glyph_width(f, code)).unwrap_or(1000.0);
+        adv += w * tfs / 1000.0 + tc;
+        if code == 32 {
+            adv += tz / 100.0 * tw;
+        }
+    }
+    adv
+}
+
+/// TJ 数组的总 advance：Num 为缩进（千分之一 em），Str 按字宽累计
+fn tj_advance(
+    font: Option<&FontInfo>,
+    items: &[Val],
+    tfs: f32,
+    tw: f32,
+    tc: f32,
+    tz: f32,
+) -> f32 {
+    let mut adv = 0.0f32;
+    for it in items {
+        match it {
+            Val::Num(n) => adv += n / 1000.0 * tfs,
+            Val::Str(s) => adv += str_advance(font, s, tfs, tw, tc, tz),
+            _ => {}
+        }
+    }
+    adv
+}
+
 // ===================== 内容流遍历（收集墨迹 x 区间） =====================
 
 pub struct Walk<'a> {
@@ -975,24 +1044,43 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// 文本：BT/ET、Tm/Td/TD/T*/TL/Tw/Tc/Tz、Tf/Tj/TJ/'/"
+    /// 文本：BT/ET 与状态操作（TL/Tw/Tc/Tz/Tf）；定位与显示分派到专用方法
     fn exec_text(
         &mut self,
         op: &str,
         args: &[Val],
         resources: Option<&'a Dictionary>,
     ) {
-        use Val::*;
         match op {
             "BT" => {
                 self.in_text = true;
                 self.tlm = Mat::I;
             }
             "ET" => self.in_text = false,
-            "Tm" => {
-                if !self.in_text {
-                    return;
+            "Tm" | "Td" | "TD" | "T*" => self.exec_text_move(op, args),
+            "Tj" | "TJ" | "'" | "\"" => self.exec_text_show(op, args),
+            "TL" => self.tl = Self::num(args, 0).unwrap_or(0.0),
+            "Tw" => self.tw = Self::num(args, 0).unwrap_or(0.0),
+            "Tc" => self.tc = Self::num(args, 0).unwrap_or(0.0),
+            "Tz" => self.tz = Self::num(args, 0).unwrap_or(100.0),
+            "Tf" => {
+                if let (Some(Val::Name(n)), Some(size)) = (args.first(), Self::num(args, 1)) {
+                    self.tfs = size;
+                    self.resolve_font(n, resources);
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// 文本定位：Tm 绝对设置；Td/TD/T* 相对移动（偏移在文本空间，
+    /// 经行矩阵线性部分缩放，与重写器同口径）
+    fn exec_text_move(&mut self, op: &str, args: &[Val]) {
+        if !self.in_text {
+            return;
+        }
+        match op {
+            "Tm" => {
                 if let (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) = (
                     Self::num(args, 0),
                     Self::num(args, 1),
@@ -1004,84 +1092,59 @@ impl<'a> Walk<'a> {
                     self.tlm = Mat::of(a, b, c, d, e, f);
                 }
             }
-            "Td" => {
-                if !self.in_text {
-                    return;
-                }
+            "Td" | "TD" => {
                 if let (Some(tx), Some(ty)) = (Self::num(args, 0), Self::num(args, 1)) {
-                    self.tlm = Mat::mul(Mat::translate(tx, ty), self.tlm);
-                }
-            }
-            "TD" => {
-                if !self.in_text {
-                    return;
-                }
-                if let (Some(tx), Some(ty)) = (Self::num(args, 0), Self::num(args, 1)) {
-                    self.tl = -ty;
-                    self.tlm = Mat::mul(Mat::translate(tx, ty), self.tlm);
-                }
-            }
-            "T*" => {
-                if !self.in_text {
-                    return;
-                }
-                self.tlm = Mat::mul(Mat::translate(0.0, -self.tl), self.tlm);
-            }
-            "TL" => self.tl = Self::num(args, 0).unwrap_or(0.0),
-            "Tw" => self.tw = Self::num(args, 0).unwrap_or(0.0),
-            "Tc" => self.tc = Self::num(args, 0).unwrap_or(0.0),
-            "Tz" => self.tz = Self::num(args, 0).unwrap_or(100.0),
-            "Tf" => {
-                if let (Some(Name(n)), Some(size)) = (args.first(), Self::num(args, 1)) {
-                    self.tfs = size;
-                    self.resolve_font(n, resources);
-                }
-            }
-            "Tj" => {
-                if self.in_text {
-                    if let Some(Str(s)) = args.last() {
-                        self.text_show(s);
+                    if op == "TD" {
+                        self.tl = -ty;
                     }
+                    self.tlm = Mat::mul(Mat::translate(tx, ty), self.tlm);
+                }
+            }
+            "T*" => self.tlm = Mat::mul(Mat::translate(0.0, -self.tl), self.tlm),
+            _ => {}
+        }
+    }
+
+    /// 文本显示：Tj/TJ 直接显示；'/" 先移到下一行行首
+    fn exec_text_show(&mut self, op: &str, args: &[Val]) {
+        if !self.in_text {
+            return;
+        }
+        match op {
+            "Tj" => {
+                if let Some(Val::Str(s)) = args.last() {
+                    self.text_show(s);
                 }
             }
             "TJ" => {
-                if self.in_text {
-                    if let Some(Arr(items)) = args.last() {
-                        self.text_emit(self.tj_advance(items));
-                    }
+                if let Some(Val::Arr(items)) = args.last() {
+                    self.text_emit(self.tj_advance(items));
                 }
             }
             "'" => {
-                if self.in_text {
-                    if let Some(Str(s)) = args.last() {
-                        self.text_next_line_show(s);
-                    }
+                if let Some(Val::Str(s)) = args.last() {
+                    self.text_next_line_show(s);
                 }
             }
             "\"" => {
-                if self.in_text {
-                    if let Some(Str(s)) = args.last() {
-                        self.tw = Self::num(args, 0).unwrap_or(0.0);
-                        self.tc = Self::num(args, 1).unwrap_or(0.0);
-                        self.text_next_line_show(s);
-                    }
+                if let Some(Val::Str(s)) = args.last() {
+                    self.tw = Self::num(args, 0).unwrap_or(0.0);
+                    self.tc = Self::num(args, 1).unwrap_or(0.0);
+                    self.text_next_line_show(s);
                 }
             }
             _ => {}
         }
     }
 
-    /// TJ 数组的总 advance（Num 缩进 + Str 字宽）
+    /// 当前字体信息
+    fn font_info(&self) -> Option<&FontInfo> {
+        self.font.and_then(|id| self.fonts.get(&id))
+    }
+
+    /// TJ 数组的总 advance（口径见 tj_advance 自由函数）
     fn tj_advance(&self, items: &[Val]) -> f32 {
-        let mut adv = 0.0f32;
-        for it in items {
-            match it {
-                Val::Num(n) => adv += n / 1000.0 * self.tfs,
-                Val::Str(s) => adv += self.string_advance(s),
-                _ => {}
-            }
-        }
-        adv
+        tj_advance(self.font_info(), items, self.tfs, self.tw, self.tc, self.tz)
     }
 
     /// 移到下一行行首并显示字符串（' 与 " 共享）
@@ -1091,58 +1154,14 @@ impl<'a> Walk<'a> {
     }
 
     fn resolve_font(&mut self, name: &[u8], resources: Option<&'a Dictionary>) {
-        let res = match resources {
-            Some(r) => r,
-            None => return,
-        };
-        let fonts = match sub_dict(self.doc, res, b"Font") {
-            Some(d) => d,
-            None => return,
-        };
-        let entry = match fonts.get(name) {
-            Ok(o) => o,
-            Err(_) => return,
-        };
-        let id = match entry {
-            Object::Reference(id) => *id,
-            _ => return,
-        };
-        if self.fonts.contains_key(&id) {
+        if let Some(id) = resolve_font_id(self.doc, resources, name, &mut self.fonts) {
             self.font = Some(id);
-            return;
         }
-        let obj = match self.doc.get_object(id) {
-            Ok(o) => o,
-            Err(_) => return,
-        };
-        let d = match obj.as_dict() {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        let info = build_font_info(self.doc, d);
-        self.fonts.insert(id, info);
-        self.font = Some(id);
     }
 
+    /// 字符串 advance（口径见 str_advance 自由函数）
     fn string_advance(&self, s: &[u8]) -> f32 {
-        let font = self.font.and_then(|id| self.fonts.get(&id));
-        let codes: Vec<u32> = match font {
-            Some(FontInfo::Cid { .. }) => s
-                .chunks(2)
-                .filter(|c| c.len() == 2)
-                .map(|c| ((c[0] as u32) << 8) | c[1] as u32)
-                .collect(),
-            _ => s.iter().map(|&b| b as u32).collect(),
-        };
-        let mut adv = 0.0f32;
-        for code in codes {
-            let w = font.map(|f| glyph_width(f, code)).unwrap_or(1000.0);
-            adv += w * self.tfs / 1000.0 + self.tc;
-            if code == 32 {
-                adv += self.tz / 100.0 * self.tw;
-            }
-        }
-        adv
+        str_advance(self.font_info(), s, self.tfs, self.tw, self.tc, self.tz)
     }
 
     fn text_show(&mut self, s: &[u8]) {
@@ -1507,7 +1526,7 @@ impl<'a> Rewriter<'a> {
         }
     }
 
-    /// 文本块内操作
+    /// 文本块内操作：定位（Tm/Td/TD）、状态（TL/Tw/Tc/Tz/Tf）分派到专用方法
     fn exec_text(&mut self, op: &str, args: &[Val]) -> bool {
         match op {
             "ET" => {
@@ -1518,8 +1537,18 @@ impl<'a> Rewriter<'a> {
             }
             "Tm" => self.exec_tm(args),
             "Td" | "TD" => self.exec_td(op, args),
+            "T*" | "Tj" | "TJ" | "'" | "\"" => self.exec_text_show(op, args),
+            "TL" | "Tw" | "Tc" | "Tz" | "Tf" => self.exec_text_state(op, args),
+            _ => false,
+        }
+    }
+
+    /// 文本显示：Tj/TJ 校验范围并前移；T*/'/" 因缺少可携带修正的操作数，
+    /// 分解为 Td + Tj（" 先补发 Tw/Tc）
+    fn exec_text_show(&mut self, op: &str, args: &[Val]) -> bool {
+        match op {
             "T*" => {
-                // T* = Td(0, -TL)；T* 无操作数不能携带修正，改发 Td
+                // T* = Td(0, -TL)
                 let w = match self.rel_move(0.0, -self.tl) {
                     Some(w) => w,
                     None => return false,
@@ -1553,18 +1582,7 @@ impl<'a> Rewriter<'a> {
                         return true;
                     }
                 };
-                let w = match self.rel_move(0.0, -self.tl) {
-                    Some(w) => w,
-                    None => return false,
-                };
-                self.block
-                    .push(Operation::new("Td", vec![w.0.into(), (-self.tl + w.1).into()]));
-                let adv = self.string_advance(s);
-                if !self.check_and_advance(adv) {
-                    return false;
-                }
-                self.block.push(Operation::new("Tj", vec![str_obj(s)]));
-                true
+                self.next_line_show(s)
             }
             "\"" => {
                 let (tw, tc, s) = match (Walk::num(args, 0), Walk::num(args, 1), args.get(2)) {
@@ -1573,24 +1591,28 @@ impl<'a> Rewriter<'a> {
                 };
                 self.tw = tw;
                 self.tc = tc;
-                let w = match self.rel_move(0.0, -self.tl) {
-                    Some(w) => w,
-                    None => return false,
-                };
                 self.block.push(Operation::new("Tw", vec![tw.into()]));
                 self.block.push(Operation::new("Tc", vec![tc.into()]));
-                self.block
-                    .push(Operation::new("Td", vec![w.0.into(), (-self.tl + w.1).into()]));
-                let adv = self.string_advance(s);
-                if !self.check_and_advance(adv) {
-                    return false;
-                }
-                self.block.push(Operation::new("Tj", vec![str_obj(s)]));
-                true
+                self.next_line_show(s)
             }
-            "TL" | "Tw" | "Tc" | "Tz" | "Tf" => self.exec_text_state(op, args),
             _ => false,
         }
+    }
+
+    /// ' 与 " 的公共尾部：换行到下一行行首（分解为 Td）并显示字符串
+    fn next_line_show(&mut self, s: &[u8]) -> bool {
+        let w = match self.rel_move(0.0, -self.tl) {
+            Some(w) => w,
+            None => return false,
+        };
+        self.block
+            .push(Operation::new("Td", vec![w.0.into(), (-self.tl + w.1).into()]));
+        let adv = self.string_advance(s);
+        if !self.check_and_advance(adv) {
+            return false;
+        }
+        self.block.push(Operation::new("Tj", vec![str_obj(s)]));
+        true
     }
 
     /// Tm：设置绝对位置。文本原点 (e,f) 经 CTM 映射到设备 (e,f)·C+t，不受 Tm
@@ -1998,74 +2020,26 @@ impl<'a> Rewriter<'a> {
         }
     }
 
-    /// 字体解析（与 Walk::resolve_font 相同）
+    /// 字体解析（Resources 用页面级 self.res；口径见 resolve_font_id）
     fn resolve_font(&mut self, name: &[u8]) {
-        let res = match self.res {
-            Some(r) => r,
-            None => return,
-        };
-        let fonts = match sub_dict(self.doc, res, b"Font") {
-            Some(d) => d,
-            None => return,
-        };
-        let entry = match fonts.get(name) {
-            Ok(o) => o,
-            Err(_) => return,
-        };
-        let id = match entry {
-            Object::Reference(id) => *id,
-            _ => return,
-        };
-        if self.fonts.contains_key(&id) {
+        if let Some(id) = resolve_font_id(self.doc, self.res, name, &mut self.fonts) {
             self.font = Some(id);
-            return;
         }
-        let obj = match self.doc.get_object(id) {
-            Ok(o) => o,
-            Err(_) => return,
-        };
-        let d = match obj_dict(obj) {
-            Some(d) => d,
-            None => return,
-        };
-        let info = build_font_info(self.doc, d);
-        self.fonts.insert(id, info);
-        self.font = Some(id);
     }
 
-    /// TJ 数组的总 advance（Num 缩进 + Str 字宽），与 Walk 相同
+    /// 当前字体信息
+    fn font_info(&self) -> Option<&FontInfo> {
+        self.font.and_then(|id| self.fonts.get(&id))
+    }
+
+    /// TJ 数组的总 advance（口径见 tj_advance 自由函数）
     fn tj_advance(&self, items: &[Val]) -> f32 {
-        let mut adv = 0.0f32;
-        for it in items {
-            match it {
-                Val::Num(n) => adv += n / 1000.0 * self.tfs,
-                Val::Str(s) => adv += self.string_advance(s),
-                _ => {}
-            }
-        }
-        adv
+        tj_advance(self.font_info(), items, self.tfs, self.tw, self.tc, self.tz)
     }
 
-    /// 字符串 advance（与 Walk::string_advance 相同）
+    /// 字符串 advance（口径见 str_advance 自由函数）
     fn string_advance(&self, s: &[u8]) -> f32 {
-        let font = self.font.and_then(|id| self.fonts.get(&id));
-        let codes: Vec<u32> = match font {
-            Some(FontInfo::Cid { .. }) => s
-                .chunks(2)
-                .filter(|c| c.len() == 2)
-                .map(|c| ((c[0] as u32) << 8) | c[1] as u32)
-                .collect(),
-            _ => s.iter().map(|&b| b as u32).collect(),
-        };
-        let mut adv = 0.0f32;
-        for code in codes {
-            let w = font.map(|f| glyph_width(f, code)).unwrap_or(1000.0);
-            adv += w * self.tfs / 1000.0 + self.tc;
-            if code == 32 {
-                adv += self.tz / 100.0 * self.tw;
-            }
-        }
-        adv
+        str_advance(self.font_info(), s, self.tfs, self.tw, self.tc, self.tz)
     }
 
     fn op_from(&self, name: &str, args: &[Val]) -> Operation {
