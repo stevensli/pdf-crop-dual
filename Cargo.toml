@@ -2,6 +2,9 @@
 name = "pdf-crop-dual"
 version = "0.1.0"
 edition = "2024"
+description = "裁剪双栏 PDF（左原文右译文）中间空带的命令行工具"
+license = "MIT OR BSD-2-Clause"
+repository = "https://github.com/stevensli/pdf-crop-dual"
 
 [dependencies]
 lopdf = "0.36"
