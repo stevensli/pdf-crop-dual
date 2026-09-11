@@ -7,4 +7,4 @@ license = "MIT OR BSD-2-Clause"
 repository = "https://github.com/stevensli/pdf-crop-dual"
 
 [dependencies]
-lopdf = "0.36"
+lopdf = "0.45"

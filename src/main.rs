@@ -62,7 +62,7 @@ struct PagePlan {
     gap: Option<(f32, f32)>,
 }
 
-/// 第一遍扫描单页；页对象/MediaBox/内容流失败时返回 None，
+/// 第一遍扫描单页；页对象/MediaBox 失败时返回 None，
 /// 缺 Resources 时返回 gap=None 的正常计划（不打错误消息）
 fn scan_page(doc: &Document, page_num: u32, page_id: ObjectId) -> Option<PagePlan> {
     let page_obj = doc.get_object(page_id).expect("获取页面对象失败");
@@ -82,11 +82,9 @@ fn scan_page(doc: &Document, page_num: u32, page_id: ObjectId) -> Option<PagePla
     };
     let (x1, y1, x2, y2) = (mediabox[0], mediabox[1], mediabox[2], mediabox[3]);
 
-    let gap = match (
-        doc.get_page_content(page_id),
-        page_resources_dict(doc, page_dict, page_id),
-    ) {
-        (Ok(content), Some(res)) => {
+    let gap = match page_resources_dict(doc, page_dict, page_id) {
+        Some(res) => {
+            let content = doc.get_page_content(page_id);
             let mut walker = Walk::new(doc);
             walker.walk(&content, Some(res), 0);
             let g = detect_gap(&walker.intervals, x1, x2);
@@ -102,11 +100,7 @@ fn scan_page(doc: &Document, page_num: u32, page_id: ObjectId) -> Option<PagePla
             }
             g
         }
-        (Err(e), _) => {
-            eprintln!("跳过第 {} 页：无法获取内容流: {}", page_num, e);
-            return None;
-        }
-        (Ok(_), None) => None,
+        None => None,
     };
 
     Some(PagePlan {
@@ -189,13 +183,7 @@ fn rebuild_page(doc: &mut Document, plan: &PagePlan, cut: f32) {
     };
 
     // 获取原始页面内容流（已解码合并）
-    let original_content = match doc.get_page_content(page_id) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("  跳过：无法获取内容流: {}", e);
-            return;
-        }
-    };
+    let original_content = doc.get_page_content(page_id);
 
     // 获取 Resources（字体、图片等）
     let resources = match get_resources(doc, &page_dict, page_id) {

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目简介
 
-pdf-crop-dual 是 Rust 命令行工具：裁剪「双栏」PDF（左栏原文、右栏译文）中间的空白带，将右栏左移使两栏相接，输出宽度变窄的新 PDF。检测到空白的页面采用「格式保留式」重写：直接改写页面级内容流，左侧墨迹原样、右侧墨迹物理左移 cut，原有 Form XObject 结构不动、内容只存在一份（文本层不翻倍，PDF 编辑工具中段落不被拆块）；不可重写时按页回退传统方案（整页封装新 Form + clip 绘制两次）。代码分两部分：`src/lib.rs`（PDF 内容分析：对象访问、矩阵几何、字体宽度、内容流词法器与 `Walk` 遍历、`detect_gap`、`rewrite_page` 重写器）与 `src/main.rs`（CLI 与两遍算法、页面重建），唯一依赖 lopdf 0.36。代码注释和输出信息使用中文，修改时保持一致。
+pdf-crop-dual 是 Rust 命令行工具：裁剪「双栏」PDF（左栏原文、右栏译文）中间的空白带，将右栏左移使两栏相接，输出宽度变窄的新 PDF。检测到空白的页面采用「格式保留式」重写：直接改写页面级内容流，左侧墨迹原样、右侧墨迹物理左移 cut，原有 Form XObject 结构不动、内容只存在一份（文本层不翻倍，PDF 编辑工具中段落不被拆块）；不可重写时按页回退传统方案（整页封装新 Form + clip 绘制两次）。代码分两部分：`src/lib.rs`（PDF 内容分析：对象访问、矩阵几何、字体宽度、内容流词法器与 `Walk` 遍历、`detect_gap`、`rewrite_page` 重写器）与 `src/main.rs`（CLI 与两遍算法、页面重建），唯一依赖 lopdf 0.45。代码注释和输出信息使用中文，修改时保持一致。
 
 ## 构建与运行
 
@@ -74,12 +74,13 @@ gs -dNOPAUSE -dBATCH -sDEVICE=pgmraw -r72 -sOutputFile=/tmp/x-%d.pgm <file.pdf>
 - **Td 偏移在文本空间**（经行矩阵线性部分缩放，`Walk` 与重写器同口径）；而 **Tm 的 (e,f) 原点不受 Tm 线性部分影响**，其移位修正只取 CTM 逆 `(s·ctm.d/det, -s·ctm.b/det)`，Td 的修正才用 ptm 逆
 - **ET 必须发射**：漏发 ET 后 gs 会丢弃后续路径绘制（实测丢墨迹）
 
-## lopdf 0.36 API 陷阱
+## lopdf 0.45 API 陷阱
 
 - `Object::as_f32()` 只接受 Real；兼容 Integer 用 `as_float()`（MediaBox 等常为 Integer）
 - `Error::ObjectNotFound` 是元组变体，需传 ObjectId：`Error::ObjectNotFound(page_id)`
 - Stream 对象是 `Object::Stream(Stream)`，`as_dict()` 对它失败；取字典用 `obj_dict()` 辅助函数（Stream 有公有字段 `dict`）——Form XObject 全是 Stream，忘记这点会导致内容扫描在第一个 Do 处静默中止
 - lopdf 不提供内容流解析器（只有编码器），`Tok`/`Val`/`Item`/`Parsed` 词法器与 `Walk` 遍历均为本项目自写
 - `Document::get_pages()` 返回 `BTreeMap<u32, ObjectId>`（页码 → 对象 ID）
+- `Document::get_page_content()` 直接返回 `Vec<u8>`（0.44 起不再是 `Result`）；某内容流解压失败时会静默回退为原始压缩字节，拿到的不一定是解码结果
 - `Dictionary::get()` 返回 `Result<&Object>`，模式匹配时除 `Ok(Dictionary)`/`Ok(Reference)` 外还有其他 Ok 变体，需要通配臂
 - test.pdf 是 PDF 1.7 并使用压缩对象流（ObjStm）：无法用原始字节搜索对象，只能经 lopdf 的 `get_object` 访问；调试对象结构可临时在 `examples/` 下写 example 运行
