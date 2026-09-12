@@ -172,7 +172,7 @@ tests/
 - **退化矩阵**：`0 0 0 0 700 0 cm` + 右路径 → None（shift_vec det≈0）。
 - **块外文本操作**：BT 之外的 Tm/Tj/Tf 原样通过（Tf 更新状态）。
 - **工具函数**：`val_to_obj`（Num→Real、Name、Str→String(Literal)、Arr 嵌套）；`shift_path_op`（m/l/re/c/v/y 各坐标位平移，未知操作符不变）；`add_to_real`（加 delta；delta=0 不动；非 Real 操作数不动）。
-- **Walk↔重写器口径一致性（核心不变量）**：构造左 Form+右 Form+直接文本的双栏内容 → Walk+detect_gap 得带 → rewrite_page 成功 → 将输出 `Content::encode()` 重新过 Walk → 区间集合满足：左侧区间原样存在、右侧区间整体 −cut 存在、无新区间落在移除带内。
+- **Walk↔重写器口径一致性（核心不变量）**：构造左 Form+右 Form+直接文本的双栏内容 → Walk+detect_gap 得带 → rewrite_page 成功 → 将输出 `Content::encode()` 重新过 Walk → 输出坐标系下的区间集合 == 原始左侧区间 ∪（原始右侧区间 − cut）（原移除带位置在输出中已被左移后的内容占据，不能以「带内无新区间」断言）。
 
 ### main_logic.rs
 - `compute_cut`：
@@ -183,7 +183,7 @@ tests/
   - spec ≤ 1 → `Err`（消息含「空白宽度必须大于 1 pt」）；
   - 最小 gap < 1（如 (100,100.5)）→ `Err`。
 - `build_form_stream`：字典 Type=XObject、Subtype=Form、FormType=1、BBox 四值、Resources 为传入对象的深拷贝；流内容 == 传入字节。
-- `build_crop_content`：**操作序列精确断言**（12 个操作）：
+- `build_crop_content`：**操作序列精确断言**（13 个操作）：
   - 左半：`q, re(x1, y1, band_left−x1, h), W, n, Do(name), Q`；
   - 右半：`q, re(band_left, y1, x2−cut−band_left, h), W, n, cm(1 0 0 1 −cut 0), Do(name), Q`；
   - **顺序不变量**：右半 `W` 的索引 < `cm` 的索引（历史 bug：clip 必须在 cm 前定义）；右裁剪区从 band_left 起、宽 `x2−cut−band_left`。
