@@ -12,9 +12,10 @@ static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// 本进程唯一的临时文件路径
 pub fn tmp_file(name: &str) -> PathBuf {
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir()
-        .join(format!("pdf-crop-dual-test-{}-{}", std::process::id(), n))
-        .join(name)
+    let dir = std::env::temp_dir()
+        .join(format!("pdf-crop-dual-test-{}-{}", std::process::id(), n));
+    std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+    dir.join(name)
 }
 
 /// 运行二进制；返回 (退出码, stdout, stderr)
@@ -103,7 +104,6 @@ pub fn image_xobject(doc: &mut Document, matrix: [f32; 6]) -> ObjectId {
 
 /// 构建页面级 Resources（字体/XObject 条目均为间接引用）
 pub fn page_resources(
-    _doc: &mut Document,
     fonts: &[(&[u8], ObjectId)],
     xobjects: &[(&[u8], ObjectId)],
 ) -> Dictionary {
@@ -152,45 +152,44 @@ pub fn gs_available() -> bool {
 /// gs 渲染单页为 72dpi PGM（1px = 1pt）
 pub fn render_pgm_page(pdf: &Path, page: u32) -> Pgm {
     let out = tmp_file(&format!("p{page}.pgm"));
+    // gs 10.x 对有值参数要求 `=` 形式（空格形式报 undefinedfilename/rangecheck）
     let o = Command::new("gs")
-        .args([
-            "-dNOPAUSE",
-            "-dBATCH",
-            "-dQUIET",
-            "-sDEVICE=pgmraw",
-            "-r72",
-            "-dFirstPage",
-            &page.to_string(),
-            "-dLastPage",
-            &page.to_string(),
-            "-sOutputFile",
-            out.to_str().expect("临时路径非 UTF-8"),
-        ])
+        .args(["-dNOPAUSE", "-dBATCH", "-dQUIET", "-sDEVICE=pgmraw", "-r72"])
+        .arg(format!("-dFirstPage={page}"))
+        .arg(format!("-dLastPage={page}"))
+        .arg(format!("-sOutputFile={}", out.display()))
         .arg(pdf)
         .output()
         .expect("执行 gs 失败");
-    assert!(o.status.success(), "gs 渲染失败: {}", String::from_utf8_lossy(&o.stderr));
-    let data = std::fs::read(&out).expect("读取 PGM 失败");
-    Pgm::parse(&data).expect("解析 PGM 失败")
+    // -dQUIET 下 gs 报错走 stdout，断言信息须双路合并
+    let gs_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "gs 渲染失败: {gs_log}");
+    // gs 打开输出文件失败时可能仍返回 0，须确认文件确实产出且非空
+    let data = std::fs::read(&out).unwrap_or_else(|e| panic!("读取 PGM 失败({e}): {gs_log}"));
+    assert!(!data.is_empty(), "PGM 输出为空: {gs_log}");
+    Pgm::parse(&data).unwrap_or_else(|| panic!("解析 PGM 失败: {gs_log}"))
 }
 
 /// gs 渲染整份 PDF 的文本层（页间以 \f 分隔）
 pub fn render_txt_file(pdf: &Path) -> String {
     let out = tmp_file("full.txt");
     let o = Command::new("gs")
-        .args([
-            "-dNOPAUSE",
-            "-dBATCH",
-            "-dQUIET",
-            "-sDEVICE=txtwrite",
-            "-sOutputFile",
-            out.to_str().expect("临时路径非 UTF-8"),
-        ])
+        .args(["-dNOPAUSE", "-dBATCH", "-dQUIET", "-sDEVICE=txtwrite"])
+        .arg(format!("-sOutputFile={}", out.display()))
         .arg(pdf)
         .output()
         .expect("执行 gs 失败");
-    assert!(o.status.success(), "gs txtwrite 失败: {}", String::from_utf8_lossy(&o.stderr));
-    std::fs::read_to_string(&out).expect("读取文本层失败")
+    let gs_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "gs txtwrite 失败: {gs_log}");
+    std::fs::read_to_string(&out).unwrap_or_else(|e| panic!("读取文本层失败({e}): {gs_log}"))
 }
 
 /// 按 form feed 字符分页（gs txtwrite 页分隔符；末尾若有空段不影响按索引取页）
@@ -246,17 +245,22 @@ impl Pgm {
         let w: usize = next_token(&mut pos)?.parse().ok()?;
         let h: usize = next_token(&mut pos)?.parse().ok()?;
         let maxval: u32 = next_token(&mut pos)?.parse().ok()?;
+        // 仅支持 8 位灰度；w*h 防溢出
+        if maxval > 255 {
+            return None;
+        }
+        let size = w.checked_mul(h)?;
         if pos < data.len() && (data[pos] as char).is_ascii_whitespace() {
             pos += 1;
         }
-        if data.len() < pos + w * h {
+        if data.len() < pos + size {
             return None;
         }
         Some(Pgm {
             width: w,
             height: h,
             maxval,
-            bytes: data[pos..pos + w * h].to_vec(),
+            bytes: data[pos..pos + size].to_vec(),
         })
     }
 
@@ -288,11 +292,12 @@ impl Pgm {
     /// 调用方保证 left_cols/cut 为整数像素（72dpi 下 px == pt）。
     pub fn manual_crop(&self, left_cols: usize, cut: usize) -> Pgm {
         assert!(left_cols + cut <= self.width, "left_cols+cut 超出原宽");
-        let left_end = left_cols * self.height;
-        let right_start = (left_cols + cut) * self.height;
+        // PGM 为行主序：逐行裁剪（保留前 left_cols 列，删去其后 cut 列）
         let mut bytes = Vec::with_capacity((self.width - cut) * self.height);
-        bytes.extend_from_slice(&self.bytes[..left_end]);
-        bytes.extend_from_slice(&self.bytes[right_start..]);
+        for row in self.bytes.chunks_exact(self.width) {
+            bytes.extend_from_slice(&row[..left_cols]);
+            bytes.extend_from_slice(&row[left_cols + cut..]);
+        }
         Pgm {
             width: self.width - cut,
             height: self.height,
@@ -304,7 +309,9 @@ impl Pgm {
 
 // ===================== Content 断言 =====================
 
-/// 操作视图：操作符 + 数值/字符串/名称操作数（便于逐操作断言）
+/// 操作视图：操作符 + 数值/字符串/名称操作数（便于逐操作断言）。
+/// 数组操作数逐元素摊平（如 TJ [(A) -20 (B)] → strs [A,B]、nums [-20]）；
+/// 其他操作数类型（如 Dictionary）仍丢弃
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpView {
     pub op: String,
@@ -321,13 +328,22 @@ pub fn view_ops(content: &Content) -> Vec<OpView> {
             let mut nums = Vec::new();
             let mut strs = Vec::new();
             let mut names = Vec::new();
-            for v in &o.operands {
+            let mut collect = |v: &Object| {
                 match v {
                     Object::Real(f) => nums.push(*f),
                     Object::Integer(i) => nums.push(*i as f32),
                     Object::String(s, _) => strs.push(s.clone()),
                     Object::Name(n) => names.push(n.clone()),
                     _ => {}
+                }
+            };
+            for v in &o.operands {
+                if let Object::Array(items) = v {
+                    for it in items {
+                        collect(it);
+                    }
+                } else {
+                    collect(v);
                 }
             }
             OpView {
@@ -354,14 +370,14 @@ pub fn assert_ops(actual: &Content, expected: &[ExpOp], ctx: &str) {
     assert_eq!(a.len(), expected.len(), "{ctx}: 操作数量不一致");
     for (i, (av, (eop, enums, estrs, enames))) in a.iter().zip(expected.iter()).enumerate() {
         assert_eq!(&av.op, eop, "{ctx}: 第 {i} 个操作符不一致");
-        assert_eq!(av.nums.len(), enums.len(), "{ctx}: 操作 {eop} 数值操作数数量");
+        assert_eq!(av.nums.len(), enums.len(), "{ctx}: 操作 #{i} {eop} 数值操作数数量");
         for (j, (x, y)) in av.nums.iter().zip(enums.iter()).enumerate() {
             assert!(
                 (x - y).abs() < 1e-3,
-                "{ctx}: 操作 {eop} 参数 {j}: 实际 {x} 期望 {y}"
+                "{ctx}: 操作 #{i} {eop} 参数 {j}: 实际 {x} 期望 {y}"
             );
         }
-        assert_eq!(&av.strs, estrs, "{ctx}: 操作 {eop} 字符串操作数不一致");
-        assert_eq!(&av.names, enames, "{ctx}: 操作 {eop} 名称操作数不一致");
+        assert_eq!(&av.strs, estrs, "{ctx}: 操作 #{i} {eop} 字符串操作数不一致");
+        assert_eq!(&av.names, enames, "{ctx}: 操作 #{i} {eop} 名称操作数不一致");
     }
 }
