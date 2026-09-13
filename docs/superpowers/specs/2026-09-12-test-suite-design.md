@@ -85,7 +85,7 @@ tests/
 - **二进制运行器**：`run_tool(args) -> (i32, String stdout, String stderr)`，二进制路径 `env!("CARGO_BIN_EXE_pdf-crop-dual")`。
 - **gs 助手**：`gs_available() -> bool`（`Command::new("gs").arg("--version")` 探测，不用 `which`）；`render_pgm(pdf, page) -> Pgm`（72dpi pgmraw，`-dFirstPage/-dLastPage` 单页）；`render_txt(pdf) -> String`（txtwrite 整文件）。
 - **PGM**：`Pgm { width, height, maxval, bytes }`；解析 P5 头（逐 token：先 "P5"，再跳过 `#` 注释行至行尾，收 width/height/maxval 三个整数，其余为像素数据）；`dark_cols(&Pgm) -> Option<(min, max)>`（灰度 < 200）；`manual_crop(orig, band_left_px: isize, cut_px: isize) -> Pgm`（左段 `[0, band_left)` 原样 + 右段 `[band_left+cut, ..)` 左移）。
-- **文本层**：`count_text_codepoints(txt) -> usize`：过滤 `[ \t\r\n\x00-\x1f]` 后 UTF-8 码点数；`split_pages(txt) -> Vec<String>`（按 `\f` 分页）。
+- **文本层**：`count_text_codepoints(txt) -> usize`：过滤 `[ \t\r\n\x00-\x1f]` 后 UTF-8 码点数；`render_txt_page(pdf, page) -> String`（txtwrite 以 `-dFirstPage/-dLastPage` 限定单页，用于逐页定位）。注：gs 10.x txtwrite 不输出 form feed 页分隔符（实测全量输出 0x0C 计数为 0），不可按 `\f` 分页。
 - **临时文件**：`tmp_file(name) -> PathBuf`（`temp_dir/pdf-crop-dual-test-{pid}-{原子计数}/{name}`）。
 - **Content 断言助手**：`ops_of(&Content) -> Vec<(String, Vec<f32>)>`（操作符 + 数值操作数，Name/String 另存）；`assert_ops(actual, expected)`（f32 容差 1e-3）。
 
@@ -209,16 +209,17 @@ tests/
 
 ### B. gs 断言（`gs_available()` 为 false 时 `eprintln!` 说明并直接返回，不失败）
 
-6. **text_layer_single_x**（spec=100）：`gs txtwrite` 各渲染原/输出一次（各 1 次调用），按 `\f` 分页后逐页过滤空白数码点：
-   - gap 页：输出码点数 == 原始（1×，格式保留核心指标）；
-   - 30/48/74：输出 == 2×原始（空白页即 0==0）。
-7. **pixel_manual_crop**（spec=100）：`pgmraw -r72` 渲染代表页集合 {1, 6, 9, 46}（普通/代码块+颜色+`i`/装饰路径/标记内容）与回退页 {30, 48, 74}：
+6. **text_layer_single_x**（spec=100）：gs 10.x txtwrite 无页分隔符，不能按 `\f` 分页，改为：
+   - 总量：输出文本层码点总数 == 原始（1×，格式保留核心指标；空白回退页贡献 0 码点，其 2× 不改变总量）；
+   - 代表 gap 页 {1, 6, 46}：逐页码点数输出 == 原始（`-dFirstPage/-dLastPage` 单页渲染定位）。
+7. **fallback_2x**（合成 1 页 PDF）：内容横跨页面中线 → 无清晰空白 → 回退传统 clip 方案，输出码点总数 == 2×原始（test.pdf 的回退页 30/48/74 为空白页，0==0 无法验证 2×，故合成含内容页验证）。
+8. **pixel_manual_crop**（spec=100）：`pgmraw -r72` 渲染代表页集合 {1, 6, 9, 46}（普通/代码块+颜色+`i`/装饰路径/标记内容）与回退页 {30, 48, 74}：
    - 输出 PGM 宽 == 908 px；
    - 移除带位置按 `rebuild_page` 同公式复算：gap 页 `c=(l+r)/2, band_left=c−cut/2`（l,r 来自 Walk+detect_gap）；无 gap 页 `band_left = x1 + (1008−cut)/2`；
    - **逐像素断言**：`输出像素 == manual_crop(原始像素)`（左段 `[0, floor(band_left)]` 原样 + 右段 `[band_left+cut, ..)` 左移；spec=100 为整数像素平移，band 内 ≥2pt 无墨迹保证等价严格成立）；
    - 若实测出现系统性 1px 差异，降级为「暗像素级全等 + 总差异像素 < 0.01%」并回写本设计文档记录。
-8. **dark_extent**（spec=100）：同代表页集合，暗像素（<200）min/max 列：左栏范围与原始一致，右栏整体左移 cut，左右缘不丢。
-9. **`#[ignore] pixel_all_pages`**：全 74 页逐像素手工裁剪比对（手动深检用，`cargo test -- --ignored`）。
+9. **dark_extent**（spec=100）：同代表页集合，暗像素（<200）min/max 列：左栏范围与原始一致，右栏整体左移 cut，左右缘不丢。
+10. **`#[ignore] pixel_all_pages`**：全 74 页逐像素手工裁剪比对（手动深检用，`cargo test -- --ignored`）。
 
 ## 7. 已知局限与风险处理
 

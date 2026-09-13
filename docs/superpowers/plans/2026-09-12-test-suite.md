@@ -344,6 +344,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - [ ] **Step 1: 写入完整文件**
 
 ```rust
+#![allow(dead_code)] // 各测试目标仅用本模块部分助手，未用项不告警
 //! 共享测试助手：合成 PDF 文档构造器、二进制运行、gs 渲染、PGM 解析、文本层计数、操作断言。
 //! 本目录（common/）不会被 cargo 当作独立测试目标，仅作为各测试文件的子模块。
 
@@ -520,7 +521,7 @@ pub fn render_pgm_page(pdf: &Path, page: u32) -> Pgm {
     Pgm::parse(&data).unwrap_or_else(|| panic!("解析 PGM 失败: {gs_log}"))
 }
 
-/// gs 渲染整份 PDF 的文本层（页间以 \f 分隔）
+/// gs 渲染整份 PDF 的文本层（gs 10.x 无页分隔符，逐页定位用 render_txt_page）
 pub fn render_txt_file(pdf: &Path) -> String {
     let out = tmp_file("full.txt");
     let o = Command::new("gs")
@@ -538,9 +539,24 @@ pub fn render_txt_file(pdf: &Path) -> String {
     std::fs::read_to_string(&out).unwrap_or_else(|e| panic!("读取文本层失败({e}): {gs_log}"))
 }
 
-/// 按 form feed 字符分页（gs txtwrite 页分隔符；末尾若有空段不影响按索引取页）
-pub fn split_pages(s: &str) -> Vec<&str> {
-    s.split('\u{0c}').collect()
+/// gs 渲染单页文本层（-dFirstPage/-dLastPage 限定单页，用于逐页定位）
+pub fn render_txt_page(pdf: &Path, page: u32) -> String {
+    let out = tmp_file(&format!("tp{page}.txt"));
+    let o = Command::new("gs")
+        .args(["-dNOPAUSE", "-dBATCH", "-dQUIET", "-sDEVICE=txtwrite"])
+        .arg(format!("-dFirstPage={page}"))
+        .arg(format!("-dLastPage={page}"))
+        .arg(format!("-sOutputFile={}", out.display()))
+        .arg(pdf)
+        .output()
+        .expect("执行 gs 失败");
+    let gs_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "gs 单页 txtwrite 失败: {gs_log}");
+    std::fs::read_to_string(&out).unwrap_or_else(|e| panic!("读取单页文本层失败({e}): {gs_log}"))
 }
 
 /// 文本层码点数：过滤 [ \t\r\n\x00-\x1f]（即 U+00..=U+20）后数 UTF-8 码点
@@ -2978,7 +2994,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ### Task 11: tests/e2e.rs —— 纯 lopdf 结构断言（测试 1-5）
 
 **Files:**
-- Create: `tests/e2e.rs`（Task 12 追加 gs 断言测试 6-9）
+- Create: `tests/e2e.rs`（Task 12 追加 gs 断言测试 6-10）
 
 **背景**：`test.pdf` 在仓库根目录（74 页，1008×661.5pt）。本任务验证 CLI 端到端行为与输出 PDF 结构（不用 gs）；像素/文本层断言在 Task 12。
 
@@ -3255,7 +3271,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ---
 
-### Task 12: tests/e2e.rs —— gs 断言（测试 6-9）
+### Task 12: tests/e2e.rs —— gs 断言（测试 6-10）
 
 **Files:**
 - Modify: `tests/e2e.rs`（Task 11 已创建；本任务扩充 imports 并追加 4 个 gs 依赖测试）
@@ -3268,35 +3284,28 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```rust
 use common::{run_tool, tmp_file};
+use lopdf::{Document, Dictionary, Object, ObjectId};
 ```
 
-替换为：
+替换为（`dictionary`/`Stream` 供回退 2× 合成文档使用）：
 
 ```rust
 use common::{
-    count_text_codepoints, gs_available, render_pgm_page, render_txt_file, run_tool,
-    split_pages, tmp_file,
+    count_text_codepoints, gs_available, page_resources, page_tree, render_pgm_page,
+    render_txt_file, render_txt_page, run_tool, tmp_file, type1_font,
 };
+use lopdf::{dictionary, Document, Dictionary, Object, ObjectId, Stream};
 ```
 
-- [ ] **Step 2: 追加 gs 依赖测试 6-9**
+- [ ] **Step 2: 追加 gs 依赖测试 6-10**
 
 在文件末尾追加：
 
 ```rust
 // ===================== gs 依赖测试（gs 缺失时跳过） =====================
 
-/// txtwrite 分页（容忍末尾多余 \f 产生的空段）
-fn pages_of(s: &str) -> Vec<&str> {
-    let mut v = split_pages(s);
-    if v.last() == Some(&"") {
-        v.pop();
-    }
-    v
-}
-
 #[test]
-fn e2e_文本层gap页1倍回退页2倍() {
+fn e2e_文本层1倍() {
     if !gs_available() {
         eprintln!("跳过 e2e_文本层：系统未安装 gs（ghostscript）");
         return;
@@ -3305,21 +3314,68 @@ fn e2e_文本层gap页1倍回退页2倍() {
     let out = tmp_file("out100txt.pdf");
     let (code, _stdout, stderr) = run_tool(&[input.to_str().unwrap(), out.to_str().unwrap(), "100"]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    let orig_pages = pages_of(&render_txt_file(input));
-    let out_pages = pages_of(&render_txt_file(&out));
-    assert_eq!(orig_pages.len(), 74, "原始 txtwrite 应 74 页");
-    assert_eq!(out_pages.len(), 74, "输出 txtwrite 应 74 页");
-    let gaps = page_gaps(&Document::load(input).expect("加载 test.pdf"));
-    for (i, (o, n)) in orig_pages.iter().zip(&out_pages).enumerate() {
-        let page = i + 1;
-        let o_cp = count_text_codepoints(o);
-        let n_cp = count_text_codepoints(n);
-        if gaps[i].is_some() {
-            assert_eq!(n_cp, o_cp, "第 {page} 页（gap）文本层应 1×：{o_cp} → {n_cp}");
-        } else {
-            assert_eq!(n_cp, 2 * o_cp, "第 {page} 页（回退）文本层应 2×：{o_cp} → {n_cp}");
-        }
+    // 总量 1×：每页内容在输出中恰好出现一次（gs 10.x txtwrite 无页分隔符，
+    // 故按总量断言；空白回退页贡献 0 码点，其 2× 不改变总量）
+    let o_cp = count_text_codepoints(&render_txt_file(input));
+    let n_cp = count_text_codepoints(&render_txt_file(&out));
+    assert_eq!(n_cp, o_cp, "输出文本层总量应 1×：{o_cp} → {n_cp}");
+    // 代表 gap 页逐页定位（页 1 纯双栏、页 6 语法高亮+路径装饰、页 46 MP 标记）
+    for page in [1u32, 6, 46] {
+        let o_cp = count_text_codepoints(&render_txt_page(input, page));
+        let n_cp = count_text_codepoints(&render_txt_page(&out, page));
+        assert_eq!(n_cp, o_cp, "第 {page} 页（gap）文本层应 1×：{o_cp} → {n_cp}");
     }
+}
+
+/// 构造 1 页回退方案 PDF：内容横跨页面中线 → 无清晰空白 → 传统 clip 方案（文本层 2×）
+fn span_fallback_pdf() -> PathBuf {
+    let mut doc = Document::new();
+    // A-D @10pt = 10pt/字符；"ABCD" 宽 40pt，置于 x∈[80,120]，横跨中线 100
+    let f = type1_font(&mut doc, 65, &[1000.0; 4]);
+    let res = page_resources(&[(b"F1", f)], &[]);
+    let res_id = doc.add_object(Object::Dictionary(res));
+    let content_id = doc.add_object(Object::Stream(Stream::new(
+        dictionary! {},
+        b"BT /F1 10 Tf 80 50 Td (ABCD) Tj ET".to_vec(),
+    )));
+    let pd = dictionary! {
+        "Type" => "Page",
+        "MediaBox" => Object::Array(vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(200.0),
+            Object::Real(100.0),
+        ]),
+        "Resources" => Object::Reference(res_id),
+        "Contents" => Object::Reference(content_id),
+    };
+    let (_page_id, parent_id) = page_tree(&mut doc, pd, Dictionary::new());
+    // lopdf 无 set_pages：页树经 trailer Root → catalog Pages 定位
+    let catalog_id = doc.add_object(Object::Dictionary(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(parent_id),
+    }));
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+    let p = tmp_file("span-fallback.pdf");
+    doc.save(&p).expect("保存合成 PDF 失败");
+    p
+}
+
+#[test]
+fn e2e_回退页文本层2倍() {
+    if !gs_available() {
+        eprintln!("跳过 e2e_回退2倍：系统未安装 gs（ghostscript）");
+        return;
+    }
+    let input = span_fallback_pdf();
+    let out = tmp_file("span-out.pdf");
+    let (code, _stdout, stderr) = run_tool(&[input.to_str().unwrap(), out.to_str().unwrap(), "20"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    // 回退方案整页绘制两次（左右 clip），文本层 2×
+    let o_cp = count_text_codepoints(&render_txt_file(&input));
+    let n_cp = count_text_codepoints(&render_txt_file(&out));
+    assert_eq!(o_cp, 4, "合成页原始应 4 码点");
+    assert_eq!(n_cp, 2 * o_cp, "回退页文本层应 2×：{o_cp} → {n_cp}");
 }
 
 #[test]
@@ -3409,7 +3465,7 @@ fn e2e_全部页像素全等() {
 - [ ] **Step 3: 运行测试**
 
 Run: `cargo test --test e2e 2>&1 | tail -12`
-Expected: `test result: ok. 9 passed; 0 failed; 1 ignored`（gs 测试首次运行约 1~2 分钟）。
+Expected: `test result: ok. 10 passed; 0 failed; 1 ignored`（gs 测试首次运行约 1~3 分钟）。
 
 - [ ] **Step 4: Commit**
 
@@ -3431,7 +3487,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - [ ] **Step 1: 全量测试**
 
 Run: `cargo test 2>&1 | grep -E "^test result|running" | tail -20`
-Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `9 passed; 1 ignored`），合计 141 个测试（9+13+12+9+7+35+31+16+9），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
+Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `10 passed; 1 ignored`），合计 142 个测试（9+13+12+9+7+35+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
 
 - [ ] **Step 2: 深检（全 74 页逐像素）**
 
