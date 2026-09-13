@@ -73,7 +73,7 @@ use lopdf::{dictionary, Document, Dictionary, Object, ObjectId, Stream, StringFo
 
 1. 几何（约 112-193 行区域）：`struct Mat` → `pub struct Mat`；`const I: Mat` → `pub const I: Mat`；`fn of` / `fn translate` / `fn mul` / `fn x_of` → `pub fn`；`fn x_extents` → `pub fn x_extents`；`fn clip_intervals_to_bbox` → `pub fn clip_intervals_to_bbox`。
 2. 字体（约 196-339 行区域）：`enum FontInfo` → `pub enum FontInfo`；`fn glyph_width`、`fn parse_w_entry`、`fn descendant_cid_font`、`fn build_cid_font_info`、`fn build_font_info`、`fn resolve_font_id` → `pub fn`。
-3. 词法器（约 343-818 行区域）：`enum Val`、`enum Item`、`enum Parsed` → `pub enum`；`struct Tok<'a>` → `pub struct Tok<'a>`，其字段 `data`/`pos` 加 `pub`；`impl<'a> Tok<'a>` 内全部 15 个方法（`skip_ws_comments`、`peek`、`peek2`、`read_word`、`parse_name`、`parse_num`、`parse_lit_string`、`parse_escape`、`parse_hex_string`、`parse_val`、`parse_array`、`skip_dict`、`skip_value`、`next_item`、`handle_inline_image`、`inline_image_length`）→ `pub fn`。
+3. 词法器（约 343-818 行区域）：`enum Val`、`enum Item`、`enum Parsed` → `pub enum`；`struct Tok<'a>` → `pub struct Tok<'a>`，其字段 `data`/`pos` 加 `pub`；`impl<'a> Tok<'a>` 内全部 16 个方法（`skip_ws_comments`、`peek`、`peek2`、`read_word`、`parse_name`、`parse_num`、`parse_lit_string`、`parse_escape`、`parse_hex_string`、`parse_val`、`parse_array`、`skip_dict`、`skip_value`、`next_item`、`handle_inline_image`、`inline_image_length`）→ `pub fn`。
 4. advance 与重写工具：`fn str_advance`、`fn tj_advance`、`fn val_to_obj`、`fn add_to_real`、`fn shift_path_op` → `pub fn`。
 
 保持私有（勿动）：`onum`、`obj_dict`、`sub_dict`、`page_inherit`、`find_xobject`、`nums_at`、`font_object_id`、`str_obj`、`Rewriter` 及其方法、`Subpath`、`Walk` 的私有字段。
@@ -244,10 +244,11 @@ pub fn update_page_boxes(
 
 - [ ] **Step 4: main.rs 更新 imports 与 compute_cut 调用点**
 
-`src/main.rs` 第 1-7 行替换为：
+`src/main.rs` 第 1-7 行替换为（保留 `use std::env;`——`parse_args` 仍用 `env::args()`；`Dictionary` 类型迁移后 main.rs 不再使用，移除）：
 
 ```rust
-use lopdf::{dictionary, Document, Dictionary, Object, ObjectId, Stream};
+use lopdf::{dictionary, Document, Object, ObjectId, Stream};
+use std::env;
 
 use pdf_crop_dual::{
     build_crop_content, build_form_stream, compute_cut, detect_gap, get_mediabox, get_resources,
@@ -448,7 +449,7 @@ pub fn image_xobject(doc: &mut Document, matrix: [f32; 6]) -> ObjectId {
 
 /// 构建页面级 Resources（字体/XObject 条目均为间接引用）
 pub fn page_resources(
-    doc: &mut Document,
+    _doc: &mut Document,
     fonts: &[(&[u8], ObjectId)],
     xobjects: &[(&[u8], ObjectId)],
 ) -> Dictionary {
@@ -471,8 +472,8 @@ pub fn page_resources(
 }
 
 /// 构造「Pages 父节点 + 单页」结构，返回 (page_id, parent_id)
-pub fn page_tree(doc: &mut Document, mut page_dict: Dictionary, mut parent_extra: Dictionary) -> (ObjectId, ObjectId) {
-    let page_id = doc.add_object(Object::Dictionary(page_dict.clone()));
+pub fn page_tree(doc: &mut Document, page_dict: Dictionary, mut parent_extra: Dictionary) -> (ObjectId, ObjectId) {
+    let page_id = doc.add_object(Object::Dictionary(page_dict));
     parent_extra.set("Type", "Pages");
     parent_extra.set("Kids", vec![Object::Reference(page_id)]);
     parent_extra.set("Count", 1);
@@ -538,9 +539,9 @@ pub fn render_txt_file(pdf: &Path) -> String {
     std::fs::read_to_string(&out).expect("读取文本层失败")
 }
 
-/// 按 \f 分页（gs txtwrite 页分隔符；末尾若有空段不影响按索引取页）
+/// 按 form feed 字符分页（gs txtwrite 页分隔符；末尾若有空段不影响按索引取页）
 pub fn split_pages(s: &str) -> Vec<&str> {
-    s.split('\f').collect()
+    s.split('\u{0c}').collect()
 }
 
 /// 文本层码点数：过滤 [ \t\r\n\x00-\x1f]（即 U+00..=U+20）后数 UTF-8 码点
@@ -564,7 +565,7 @@ impl Pgm {
     /// maxval 之后按 P5 规范恰好一个空白字符，其后为像素数据
     pub fn parse(data: &[u8]) -> Option<Pgm> {
         let mut pos = 0usize;
-        let mut next_token = |pos: &mut usize| -> Option<Vec<u8>> {
+        let next_token = |pos: &mut usize| -> Option<String> {
             loop {
                 while *pos < data.len() && (data[*pos] as char).is_ascii_whitespace() {
                     *pos += 1;
@@ -582,10 +583,10 @@ impl Pgm {
                 if s == *pos {
                     return None;
                 }
-                Some(data[s..*pos].to_vec())
+                break Some(String::from_utf8_lossy(&data[s..*pos]).into_owned());
             }
         };
-        if next_token(&mut pos)? != b"P5" {
+        if next_token(&mut pos)? != "P5" {
             return None;
         }
         let w: usize = next_token(&mut pos)?.parse().ok()?;
@@ -706,18 +707,27 @@ pub fn assert_ops(actual: &Content, expected: &[ExpOp], ctx: &str) {
                 "{ctx}: 操作 {eop} 参数 {j}: 实际 {x} 期望 {y}"
             );
         }
-        assert_eq!(av.strs, estrs, "{ctx}: 操作 {eop} 字符串操作数不一致");
-        assert_eq!(av.names, enames, "{ctx}: 操作 {eop} 名称操作数不一致");
+        assert_eq!(&av.strs, estrs, "{ctx}: 操作 {eop} 字符串操作数不一致");
+        assert_eq!(&av.names, enames, "{ctx}: 操作 {eop} 名称操作数不一致");
     }
 }
 ```
 
-- [ ] **Step 2: 编译验证（作为模块被引用前至少语法通过）**
+- [ ] **Step 2: 编译验证（临时引用文件冒烟）**
 
-common/mod.rs 单独存在时不会被编译。用任一测试文件引用验证（Task 3 创建 geometry.rs 后自然验证）。此处仅确认文件已创建：
+common/mod.rs 单独存在时 cargo 不编译它（无测试目标引用）。用临时引用文件验证：
 
-Run: `ls tests/common/mod.rs && wc -l tests/common/mod.rs`
-Expected: 文件存在，约 330 行。
+1. 创建 `tests/zz_smoke.rs`，内容为：
+
+```rust
+#[allow(dead_code)]
+mod common;
+```
+
+2. Run: `cargo test --test zz_smoke`
+Expected: 编译通过且 0 警告，运行结果 `0 passed; 0 failed`
+
+3. 删除 `tests/zz_smoke.rs`（临时文件，不提交）
 
 - [ ] **Step 3: Commit**
 
