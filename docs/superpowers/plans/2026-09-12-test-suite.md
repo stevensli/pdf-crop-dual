@@ -1157,8 +1157,8 @@ fn str_advance_simple字体() {
         first: 32,
         widths: vec![500.0, 1000.0],
     };
-    // 'A'=32→500, 'B'=33→1000；@tfs=10 → 5 + 10
-    assert_eq!(str_advance(Some(&f), b"AB", 10.0, 0.0, 0.0, 100.0), 15.0);
+    // 空格(32)→500, '!'(33)→1000；@tfs=10 → 5 + 10
+    assert_eq!(str_advance(Some(&f), b" !", 10.0, 0.0, 0.0, 100.0), 15.0);
     // 码字超出 Widths 范围 → 1em 回退
     assert_eq!(str_advance(Some(&f), b"C", 10.0, 0.0, 0.0, 100.0), 10.0);
 }
@@ -1243,7 +1243,8 @@ fn parse_w_entry三种形式() {
     assert!(m.is_empty());
 
     let mut m = HashMap::new();
-    parse_w_entry(&[10.0.into(), w_pair_array(10.0, &[100.0, 200.0, 300.0])], &mut m);
+    let entry = w_pair_array(10.0, &[100.0, 200.0, 300.0]);
+    parse_w_entry(entry.as_array().unwrap(), &mut m);
     assert_eq!(m.get(&10u16), Some(&100.0));
     assert_eq!(m.get(&11u16), Some(&200.0));
     assert_eq!(m.get(&12u16), Some(&300.0));
@@ -1252,7 +1253,8 @@ fn parse_w_entry三种形式() {
 #[test]
 fn parse_w_entry_u16环绕() {
     let mut m = HashMap::new();
-    parse_w_entry(&[65535.0.into(), w_pair_array(65535.0, &[100.0, 200.0])], &mut m);
+    let entry = w_pair_array(65535.0, &[100.0, 200.0]);
+    parse_w_entry(entry.as_array().unwrap(), &mut m);
     assert_eq!(m.get(&65535u16), Some(&100.0));
     assert_eq!(m.get(&0u16), Some(&200.0));
 }
@@ -1304,7 +1306,7 @@ fn build_font_info_type0_cid() {
             assert_eq!(widths.get(&10u16), Some(&100.0));
             assert_eq!(widths.get(&11u16), Some(&200.0));
             assert_eq!(widths.get(&9u16), Some(&600.0));
-            assert_eq!(widths.len(), 6);
+            assert_eq!(widths.len(), 7); // 4（5..=8）+ 2（10,11）+ 1（9）
         }
         _ => panic!("期望 Cid"),
     }

@@ -112,7 +112,7 @@ tests/
 
 ### fonts.rs
 - `str_advance` 无字体：每字节 1em（`len * tfs`）。
-- Simple 字体：`first=32, widths=[500; '!'=1000]`，`"A!"`@tfs=10 → 15.0；码字超出 Widths 范围 → 1000 回退。
+- Simple 字体：`first=32, widths=[空格=500, '!'=1000]`，`" !"`（空格+'!' = 码字 32/33）@tfs=10 → 15.0；码字超出 Widths 范围 → 1000 回退。
 - CID 字体：2 字节解码（`b"\x00\x41\x00\x42"`），widths 命中/未命中（用 DW）；奇数字节串丢弃末字节。
 - `Tc` 逐字形累加；`Tz` 仅对码字 32（空格）加 `tz/100 * tw`。
 - `tj_advance`：`[Str, Num(-200), Str]` 缩进项 = `-0.2 * tfs`。
