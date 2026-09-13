@@ -1,7 +1,7 @@
 //! PDF 内容分析库：对象访问、几何、字体宽度、内容流词法器与遍历、空白检测、内容重写。
 
 use lopdf::content::{Content, Operation};
-use lopdf::{Document, Dictionary, Object, ObjectId, StringFormat};
+use lopdf::{dictionary, Document, Dictionary, Object, ObjectId, Stream, StringFormat};
 use std::collections::{HashMap, HashSet};
 
 /// 获取条目：优先页面字典，否则从父 Pages 节点继承；父节点非字典时报 ObjectNotFound
@@ -111,7 +111,7 @@ fn find_xobject<'a>(
 
 /// PDF 3x2 矩阵（行向量约定：p' = p·M）
 #[derive(Clone, Copy)]
-struct Mat {
+pub struct Mat {
     a: f32,
     b: f32,
     c: f32,
@@ -121,7 +121,7 @@ struct Mat {
 }
 
 impl Mat {
-    const I: Mat = Mat {
+    pub const I: Mat = Mat {
         a: 1.0,
         b: 0.0,
         c: 0.0,
@@ -130,7 +130,7 @@ impl Mat {
         f: 0.0,
     };
 
-    fn of(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> Mat {
+    pub fn of(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> Mat {
         Mat {
             a,
             b,
@@ -142,12 +142,12 @@ impl Mat {
     }
 
     /// 平移矩阵
-    fn translate(x: f32, y: f32) -> Mat {
+    pub fn translate(x: f32, y: f32) -> Mat {
         Mat::of(1.0, 0.0, 0.0, 1.0, x, y)
     }
 
     /// 先应用 m1 再应用 m2（p·m1·m2）
-    fn mul(m1: Mat, m2: Mat) -> Mat {
+    pub fn mul(m1: Mat, m2: Mat) -> Mat {
         Mat::of(
             m1.a * m2.a + m1.b * m2.c,
             m1.a * m2.b + m1.b * m2.d,
@@ -158,13 +158,13 @@ impl Mat {
         )
     }
 
-    fn x_of(&self, x: f32, y: f32) -> f32 {
+    pub fn x_of(&self, x: f32, y: f32) -> f32 {
         self.a * x + self.c * y + self.e
     }
 }
 
 /// 点集经矩阵投影后的 x 范围 (min, max)；调用方须保证点集非空
-fn x_extents(m: Mat, pts: &[(f32, f32)]) -> (f32, f32) {
+pub fn x_extents(m: Mat, pts: &[(f32, f32)]) -> (f32, f32) {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
     for &(x, y) in pts {
@@ -176,7 +176,7 @@ fn x_extents(m: Mat, pts: &[(f32, f32)]) -> (f32, f32) {
 }
 
 /// 将 mark 之后产生的区间按 [bx0, bx1] 钳位；仅保留非空结果（a2 < b2）
-fn clip_intervals_to_bbox(
+pub fn clip_intervals_to_bbox(
     intervals: &mut Vec<(f32, f32)>,
     mark: usize,
     bx0: f32,
@@ -193,7 +193,7 @@ fn clip_intervals_to_bbox(
 }
 
 #[derive(Clone)]
-enum FontInfo {
+pub enum FontInfo {
     Simple {
         first: i64,
         widths: Vec<f32>,
@@ -205,7 +205,7 @@ enum FontInfo {
     Unknown,
 }
 
-fn glyph_width(font: &FontInfo, code: u32) -> f32 {
+pub fn glyph_width(font: &FontInfo, code: u32) -> f32 {
     match font {
         FontInfo::Simple { first, widths } => {
             let i = code as i64 - *first;
@@ -220,7 +220,7 @@ fn glyph_width(font: &FontInfo, code: u32) -> f32 {
     }
 }
 
-fn parse_w_entry(arr: &[Object], widths: &mut HashMap<u16, f32>) {
+pub fn parse_w_entry(arr: &[Object], widths: &mut HashMap<u16, f32>) {
     let nums: Vec<f32> = arr.iter().filter_map(onum).collect();
     if arr.len() == 2 && nums.len() == 2 {
         widths.insert(nums[0] as u16, nums[1]);
@@ -252,7 +252,7 @@ fn nums_at(a: &[Object], count: usize) -> Option<Vec<f32>> {
 }
 
 /// DescendantFonts 数组 → 首个 CIDFont 字典（两跳 deref）
-fn descendant_cid_font<'a>(
+pub fn descendant_cid_font<'a>(
     doc: &'a Document,
     d: &'a Dictionary,
 ) -> Option<&'a Dictionary> {
@@ -269,7 +269,7 @@ fn descendant_cid_font<'a>(
 }
 
 /// Type0/Type0C 复合字体宽度信息；缺 DescendantFonts 时返回空 Cid
-fn build_cid_font_info<'a>(doc: &'a Document, d: &'a Dictionary) -> FontInfo {
+pub fn build_cid_font_info<'a>(doc: &'a Document, d: &'a Dictionary) -> FontInfo {
     let mut widths: HashMap<u16, f32> = HashMap::new();
     let mut dw = 1000.0f32;
     if let Some(cd) = descendant_cid_font(doc, d) {
@@ -287,7 +287,7 @@ fn build_cid_font_info<'a>(doc: &'a Document, d: &'a Dictionary) -> FontInfo {
     FontInfo::Cid { widths, dw }
 }
 
-fn build_font_info<'a>(doc: &'a Document, d: &'a Dictionary) -> FontInfo {
+pub fn build_font_info<'a>(doc: &'a Document, d: &'a Dictionary) -> FontInfo {
     let subtype = d.get(b"Subtype").ok().and_then(|o| o.as_name().ok());
     match subtype {
         Some(s) if s == b"Type0" || s == b"Type0C" => build_cid_font_info(doc, d),
@@ -324,7 +324,7 @@ fn font_object_id(doc: &Document, res: Option<&Dictionary>, name: &[u8]) -> Opti
 }
 
 /// 解析字体名：查 /Font 子字典，FontInfo 缺失时构建并入缓存；成功返回字体 id
-fn resolve_font_id(
+pub fn resolve_font_id(
     doc: &Document,
     res: Option<&Dictionary>,
     name: &[u8],
@@ -341,19 +341,19 @@ fn resolve_font_id(
 // ===================== 内容流词法分析 =====================
 
 #[derive(Debug)]
-enum Val {
+pub enum Val {
     Num(f32),
     Name(Vec<u8>),
     Str(Vec<u8>),
     Arr(Vec<Val>),
 }
 
-enum Item {
+pub enum Item {
     Op(String),
     Val(Val),
 }
 
-enum Parsed {
+pub enum Parsed {
     Val(Val),
     Word(Vec<u8>),
     DictSkipped,
@@ -371,13 +371,13 @@ fn is_delim(b: u8) -> bool {
     )
 }
 
-struct Tok<'a> {
-    data: &'a [u8],
-    pos: usize,
+pub struct Tok<'a> {
+    pub data: &'a [u8],
+    pub pos: usize,
 }
 
 impl<'a> Tok<'a> {
-    fn skip_ws_comments(&mut self) {
+    pub fn skip_ws_comments(&mut self) {
         loop {
             while self.pos < self.data.len() && is_ws(self.data[self.pos]) {
                 self.pos += 1;
@@ -394,15 +394,15 @@ impl<'a> Tok<'a> {
         }
     }
 
-    fn peek(&self) -> Option<u8> {
+    pub fn peek(&self) -> Option<u8> {
         self.data.get(self.pos).copied()
     }
 
-    fn peek2(&self) -> Option<u8> {
+    pub fn peek2(&self) -> Option<u8> {
         self.data.get(self.pos + 1).copied()
     }
 
-    fn read_word(&mut self) -> Vec<u8> {
+    pub fn read_word(&mut self) -> Vec<u8> {
         let s = self.pos;
         while self.pos < self.data.len()
             && !is_ws(self.data[self.pos])
@@ -413,7 +413,7 @@ impl<'a> Tok<'a> {
         self.data[s..self.pos].to_vec()
     }
 
-    fn parse_name(&mut self) -> Vec<u8> {
+    pub fn parse_name(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         while let Some(b) = self.peek() {
             if is_ws(b) || is_delim(b) {
@@ -438,7 +438,7 @@ impl<'a> Tok<'a> {
         out
     }
 
-    fn parse_num(&mut self) -> Option<f32> {
+    pub fn parse_num(&mut self) -> Option<f32> {
         let s = self.pos;
         if matches!(self.peek(), Some(b'+') | Some(b'-')) {
             self.pos += 1;
@@ -458,7 +458,7 @@ impl<'a> Tok<'a> {
         std::str::from_utf8(&self.data[s..self.pos]).ok()?.parse().ok()
     }
 
-    fn parse_lit_string(&mut self) -> Option<Vec<u8>> {
+    pub fn parse_lit_string(&mut self) -> Option<Vec<u8>> {
         self.pos += 1; // '('
         let mut out = Vec::new();
         let mut depth = 1usize;
@@ -495,7 +495,7 @@ impl<'a> Tok<'a> {
 
     /// 解析单个转义字符（pos 已在 '\\' 之后）：
     /// 外层 None = 数据结束；内层 None = \r / \n 行续（消耗但不产生字节）
-    fn parse_escape(&mut self) -> Option<Option<u8>> {
+    pub fn parse_escape(&mut self) -> Option<Option<u8>> {
         let c = self.peek()?;
         Some(match c {
             b'n' => {
@@ -555,7 +555,7 @@ impl<'a> Tok<'a> {
         })
     }
 
-    fn parse_hex_string(&mut self) -> Option<Vec<u8>> {
+    pub fn parse_hex_string(&mut self) -> Option<Vec<u8>> {
         self.pos += 1; // '<'
         let mut hex = Vec::new();
         while let Some(b) = self.peek() {
@@ -587,7 +587,7 @@ impl<'a> Tok<'a> {
     }
 
     /// 解析单个值；裸词返回 Word，字典整体跳过
-    fn parse_val(&mut self) -> Parsed {
+    pub fn parse_val(&mut self) -> Parsed {
         self.skip_ws_comments();
         let b = match self.peek() {
             Some(b) => b,
@@ -630,7 +630,7 @@ impl<'a> Tok<'a> {
     }
 
     /// 解析数组（含 '[' 消耗）；Word/DictSkipped 元素丢弃
-    fn parse_array(&mut self) -> Option<Vec<Val>> {
+    pub fn parse_array(&mut self) -> Option<Vec<Val>> {
         self.pos += 1; // '['
         let mut arr = Vec::new();
         loop {
@@ -652,7 +652,7 @@ impl<'a> Tok<'a> {
     }
 
     /// 跳过整个字典（键值对）
-    fn skip_dict(&mut self) -> bool {
+    pub fn skip_dict(&mut self) -> bool {
         loop {
             self.skip_ws_comments();
             match self.peek() {
@@ -677,7 +677,7 @@ impl<'a> Tok<'a> {
     }
 
     /// 跳过字典中的一个值（含数组配平、字符串、嵌套字典、"n n R" 对象引用）；失败返回 false
-    fn skip_value(&mut self) -> bool {
+    pub fn skip_value(&mut self) -> bool {
         self.skip_ws_comments();
         match self.peek() {
             Some(b'[') => {
@@ -735,7 +735,7 @@ impl<'a> Tok<'a> {
         true
     }
 
-    fn next_item(&mut self) -> Option<Item> {
+    pub fn next_item(&mut self) -> Option<Item> {
         match self.parse_val() {
             Parsed::Val(v) => Some(Item::Val(v)),
             Parsed::Word(w) if !w.is_empty() => {
@@ -748,7 +748,7 @@ impl<'a> Tok<'a> {
     }
 
     /// 处理内联图像 BI ... ID <原始字节> EI
-    fn handle_inline_image(&mut self) -> bool {
+    pub fn handle_inline_image(&mut self) -> bool {
         self.skip_ws_comments();
         if self.peek() != Some(b'<') || self.peek2() != Some(b'<') {
             return false;
@@ -786,7 +786,7 @@ impl<'a> Tok<'a> {
     }
 
     /// 读内联图像 BI 字典（调用方已消耗 "<<"）并返回 /Length；缺 Length 或出错返回 None
-    fn inline_image_length(&mut self) -> Option<usize> {
+    pub fn inline_image_length(&mut self) -> Option<usize> {
         let mut length: Option<usize> = None;
         loop {
             self.skip_ws_comments();
@@ -821,7 +821,7 @@ impl<'a> Tok<'a> {
 
 /// 字符串 advance：逐码字宽 + 字距 Tc；空格额外加 Tz/100·Tw。
 /// CID 字体按 2 字节解码，其余按 1 字节；无字体信息按 1em（过估是安全方向）
-fn str_advance(font: Option<&FontInfo>, s: &[u8], tfs: f32, tw: f32, tc: f32, tz: f32) -> f32 {
+pub fn str_advance(font: Option<&FontInfo>, s: &[u8], tfs: f32, tw: f32, tc: f32, tz: f32) -> f32 {
     let codes: Vec<u32> = match font {
         Some(FontInfo::Cid { .. }) => s
             .chunks(2)
@@ -842,7 +842,7 @@ fn str_advance(font: Option<&FontInfo>, s: &[u8], tfs: f32, tw: f32, tc: f32, tz
 }
 
 /// TJ 数组的总 advance：Num 为缩进（千分之一 em），Str 按字宽累计
-fn tj_advance(
+pub fn tj_advance(
     font: Option<&FontInfo>,
     items: &[Val],
     tfs: f32,
@@ -2053,7 +2053,7 @@ impl<'a> Rewriter<'a> {
 }
 
 /// Val → lopdf Object（字符串用字面量形式，write_string 会自动转义）
-fn val_to_obj(v: &Val) -> Object {
+pub fn val_to_obj(v: &Val) -> Object {
     match v {
         Val::Num(n) => Object::Real(*n),
         Val::Name(n) => Object::Name(n.clone()),
@@ -2068,7 +2068,7 @@ fn str_obj(s: &[u8]) -> Object {
 }
 
 /// 将操作符第 idx 个数字操作数加上 delta（此处生成的操作数均为 Real）
-fn add_to_real(op: &mut Operation, idx: usize, delta: f32) {
+pub fn add_to_real(op: &mut Operation, idx: usize, delta: f32) {
     if delta != 0.0 {
         if let Some(Object::Real(v)) = op.operands.get_mut(idx) {
             *v += delta;
@@ -2077,7 +2077,7 @@ fn add_to_real(op: &mut Operation, idx: usize, delta: f32) {
 }
 
 /// 路径构造操作符的坐标按操作空间平移 (dx, dy)
-fn shift_path_op(op: &mut Operation, w: (f32, f32)) {
+pub fn shift_path_op(op: &mut Operation, w: (f32, f32)) {
     let idx: &[(usize, usize)] = match op.operator.as_str() {
         "m" | "l" | "re" => &[(0, 1)],
         "c" => &[(0, 1), (2, 3), (4, 5)],
@@ -2091,5 +2091,163 @@ fn shift_path_op(op: &mut Operation, w: (f32, f32)) {
         if let Some(Object::Real(v)) = op.operands.get_mut(yi) {
             *v += w.1;
         }
+    }
+}
+
+// ===================== 页面重建辅助函数（自 main.rs 迁入，行为不变） =====================
+
+/// 收敛实际移除宽度：不超过所有页最小空白宽度；cut<=1 时 Err
+/// 返回 (实际 cut, 最小检测到的空白宽；无任何 gap 页时为 f32::INFINITY)
+pub fn compute_cut(gaps: &[Option<(f32, f32)>], gap_width: f32) -> Result<(f32, f32), String> {
+    let min_detected = gaps
+        .iter()
+        .copied()
+        .flatten()
+        .map(|(l, r)| r - l)
+        .fold(f32::INFINITY, f32::min);
+    let cut = gap_width.min(min_detected);
+    if cut <= 1.0 {
+        return Err("空白宽度必须大于 1 pt，且页面需存在足够的中间空白".into());
+    }
+    Ok((cut, min_detected))
+}
+
+/// 构建封装原页面内容的 Form XObject 流（BBox = 原页面框，Resources 从页复制）
+pub fn build_form_stream(
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    resources: &Object,
+    content: Vec<u8>,
+) -> Stream {
+    let mut form_dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Form",
+        "FormType" => 1,
+        "BBox" => vec![x1.into(), y1.into(), x2.into(), y2.into()],
+    };
+    // 将 Resources 复制到 Form XObject，确保字体等资源可用
+    if let Ok(res_dict) = resources.as_dict() {
+        form_dict.set("Resources", Object::Dictionary(res_dict.clone()));
+    }
+    Stream::new(form_dict, content)
+}
+
+/// 将 Form XObject 注册进页面 /Resources /XObject（内联字典提取为独立对象）
+pub fn register_form_xobject(
+    doc: &mut Document,
+    page_dict: &Dictionary,
+    page_id: ObjectId,
+    form_name: &[u8],
+    form_id: ObjectId,
+) {
+    // 确保页面有 Resources 对象
+    let resources_id = match page_dict.get(b"Resources") {
+        Ok(Object::Reference(id)) => *id,
+        Ok(Object::Dictionary(d)) => {
+            // 内联字典 → 提取为独立对象
+            doc.add_object(Object::Dictionary(d.clone()))
+        }
+        _ => doc.add_object(Dictionary::new()),
+    };
+
+    // 更新页面对 Resources 的引用
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(page_id) {
+        d.set("Resources", Object::Reference(resources_id));
+    }
+
+    // 在 Resources 中添加 XObject 条目
+    if let Ok(Object::Dictionary(res_dict)) = doc.get_object_mut(resources_id) {
+        let mut xobjects = match res_dict.get(b"XObject") {
+            Ok(Object::Dictionary(xo)) => xo.clone(),
+            _ => Dictionary::new(),
+        };
+        xobjects.set(form_name.to_vec(), Object::Reference(form_id));
+        res_dict.set("XObject", Object::Dictionary(xobjects));
+    }
+}
+
+/// 构建新页面内容流：左半保留 [x1, band_left]，右半保留并整体左移 cut。
+/// 注意裁剪矩形必须在 cm 之前定义（新页面坐标系），否则会随平移一起偏移
+pub fn build_crop_content(
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    band_left: f32,
+    cut: f32,
+    form_name: &[u8],
+) -> Content {
+    let height = y2 - y1;
+    Content {
+        operations: vec![
+            // ===== 左半边：保留 [x1, band_left] =====
+            Operation::new("q", vec![]),
+            Operation::new("re", vec![
+                x1.into(),
+                y1.into(),
+                (band_left - x1).into(),
+                height.into()
+            ]),
+            Operation::new("W", vec![]),
+            Operation::new("n", vec![]),
+            Operation::new("Do", vec![Object::Name(form_name.to_vec())]),
+            Operation::new("Q", vec![]),
+
+            // ===== 右半边：保留 [band_right, x2]，整体左移 cut =====
+            Operation::new("q", vec![]),
+            Operation::new("re", vec![
+                band_left.into(),
+                y1.into(),
+                (x2 - cut - band_left).into(),
+                height.into()
+            ]),
+            Operation::new("W", vec![]),
+            Operation::new("n", vec![]),
+            Operation::new("cm", vec![
+                1.0.into(),
+                0.0.into(),
+                0.0.into(),
+                1.0.into(),
+                (-cut).into(),
+                0.0.into()
+            ]),
+            Operation::new("Do", vec![Object::Name(form_name.to_vec())]),
+            Operation::new("Q", vec![]),
+        ],
+    }
+}
+
+/// 替换页面 Contents/MediaBox/CropBox（CropBox 仅当已存在），删除 TrimBox/BleedBox/ArtBox
+pub fn update_page_boxes(
+    doc: &mut Document,
+    page_id: ObjectId,
+    new_content_id: ObjectId,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    cut: f32,
+) {
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(page_id) {
+        d.set("Contents", Object::Reference(new_content_id));
+        d.set("MediaBox", Object::Array(vec![
+            x1.into(),
+            y1.into(),
+            (x2 - cut).into(),
+            y2.into()
+        ]));
+        if d.has(b"CropBox") {
+            d.set("CropBox", Object::Array(vec![
+                x1.into(),
+                y1.into(),
+                (x2 - cut).into(),
+                y2.into()
+            ]));
+        }
+        d.remove(b"TrimBox");
+        d.remove(b"BleedBox");
+        d.remove(b"ArtBox");
     }
 }

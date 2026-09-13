@@ -1,9 +1,9 @@
-use lopdf::content::{Content, Operation};
-use lopdf::{dictionary, Document, Dictionary, Object, ObjectId, Stream};
+use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 use std::env;
 
 use pdf_crop_dual::{
-    detect_gap, get_mediabox, get_resources, page_resources_dict, rewrite_page, Walk,
+    build_crop_content, build_form_stream, compute_cut, detect_gap, get_mediabox, get_resources,
+    page_resources_dict, register_form_xobject, rewrite_page, update_page_boxes, Walk,
 };
 
 fn main() {
@@ -23,7 +23,20 @@ fn main() {
     }
 
     // 实际移除宽度不超过所有页的最小空白宽度，保证每页输出宽度一致
-    let cut = compute_cut(&plans, gap_width);
+    let gaps: Vec<Option<(f32, f32)>> = plans.iter().map(|p| p.gap).collect();
+    let (cut, min_detected) = match compute_cut(&gaps, gap_width) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("错误：{}", msg);
+            std::process::exit(1);
+        }
+    };
+    if min_detected.is_finite() && (cut - gap_width).abs() > 0.005 {
+        println!(
+            "提示：最窄页面的空白仅 {:.1} pt，移除宽度由 {:.1} 调整为 {:.1} pt",
+            min_detected, gap_width, cut
+        );
+    }
 
     // ---------- 第二遍：重建每页内容流 ----------
     for plan in &plans {
@@ -114,27 +127,6 @@ fn scan_page(doc: &Document, page_num: u32, page_id: ObjectId) -> Option<PagePla
     })
 }
 
-/// 收敛实际移除宽度：不超过所有页最小空白宽度；cut<=1 时报错退出
-fn compute_cut(plans: &[PagePlan], gap_width: f32) -> f32 {
-    let min_detected = plans
-        .iter()
-        .filter_map(|p| p.gap)
-        .map(|(l, r)| r - l)
-        .fold(f32::INFINITY, f32::min);
-    let cut = gap_width.min(min_detected);
-    if cut <= 1.0 {
-        eprintln!("错误：空白宽度必须大于 1 pt，且页面需存在足够的中间空白");
-        std::process::exit(1);
-    }
-    if min_detected.is_finite() && (cut - gap_width).abs() > 0.005 {
-        println!(
-            "提示：最窄页面的空白仅 {:.1} pt，移除宽度由 {:.1} 调整为 {:.1} pt",
-            min_detected, gap_width, cut
-        );
-    }
-    cut
-}
-
 /// 第二遍重建单页内容流；页面宽度过小或获取失败时跳过
 fn rebuild_page(doc: &mut Document, plan: &PagePlan, cut: f32) {
     let PagePlan {
@@ -222,144 +214,4 @@ fn rebuild_page(doc: &mut Document, plan: &PagePlan, cut: f32) {
 
     // 更新页面字典：替换 Contents、MediaBox、CropBox
     update_page_boxes(doc, page_id, new_content_id, x1, y1, x2, y2, cut);
-}
-
-/// 构建封装原页面内容的 Form XObject 流（BBox = 原页面框，Resources 从页复制）
-fn build_form_stream(
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-    resources: &Object,
-    content: Vec<u8>,
-) -> Stream {
-    let mut form_dict = dictionary! {
-        "Type" => "XObject",
-        "Subtype" => "Form",
-        "FormType" => 1,
-        "BBox" => vec![x1.into(), y1.into(), x2.into(), y2.into()],
-    };
-    // 将 Resources 复制到 Form XObject，确保字体等资源可用
-    if let Ok(res_dict) = resources.as_dict() {
-        form_dict.set("Resources", Object::Dictionary(res_dict.clone()));
-    }
-    Stream::new(form_dict, content)
-}
-
-/// 将 Form XObject 注册进页面 /Resources /XObject（内联字典提取为独立对象）
-fn register_form_xobject(
-    doc: &mut Document,
-    page_dict: &Dictionary,
-    page_id: ObjectId,
-    form_name: &[u8],
-    form_id: ObjectId,
-) {
-    // 确保页面有 Resources 对象
-    let resources_id = match page_dict.get(b"Resources") {
-        Ok(Object::Reference(id)) => *id,
-        Ok(Object::Dictionary(d)) => {
-            // 内联字典 → 提取为独立对象
-            doc.add_object(Object::Dictionary(d.clone()))
-        }
-        _ => doc.add_object(Dictionary::new()),
-    };
-
-    // 更新页面对 Resources 的引用
-    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(page_id) {
-        d.set("Resources", Object::Reference(resources_id));
-    }
-
-    // 在 Resources 中添加 XObject 条目
-    if let Ok(Object::Dictionary(res_dict)) = doc.get_object_mut(resources_id) {
-        let mut xobjects = match res_dict.get(b"XObject") {
-            Ok(Object::Dictionary(xo)) => xo.clone(),
-            _ => Dictionary::new(),
-        };
-        xobjects.set(form_name.to_vec(), Object::Reference(form_id));
-        res_dict.set("XObject", Object::Dictionary(xobjects));
-    }
-}
-
-/// 构建新页面内容流：左半保留 [x1, band_left]，右半保留并整体左移 cut。
-/// 注意裁剪矩形必须在 cm 之前定义（新页面坐标系），否则会随平移一起偏移
-fn build_crop_content(
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-    band_left: f32,
-    cut: f32,
-    form_name: &[u8],
-) -> Content {
-    let height = y2 - y1;
-    Content {
-        operations: vec![
-            // ===== 左半边：保留 [x1, band_left] =====
-            Operation::new("q", vec![]),
-            Operation::new("re", vec![
-                x1.into(),
-                y1.into(),
-                (band_left - x1).into(),
-                height.into()
-            ]),
-            Operation::new("W", vec![]),
-            Operation::new("n", vec![]),
-            Operation::new("Do", vec![Object::Name(form_name.to_vec())]),
-            Operation::new("Q", vec![]),
-
-            // ===== 右半边：保留 [band_right, x2]，整体左移 cut =====
-            Operation::new("q", vec![]),
-            Operation::new("re", vec![
-                band_left.into(),
-                y1.into(),
-                (x2 - cut - band_left).into(),
-                height.into()
-            ]),
-            Operation::new("W", vec![]),
-            Operation::new("n", vec![]),
-            Operation::new("cm", vec![
-                1.0.into(),
-                0.0.into(),
-                0.0.into(),
-                1.0.into(),
-                (-cut).into(),
-                0.0.into()
-            ]),
-            Operation::new("Do", vec![Object::Name(form_name.to_vec())]),
-            Operation::new("Q", vec![]),
-        ],
-    }
-}
-
-/// 替换页面 Contents/MediaBox/CropBox（CropBox 仅当已存在），删除 TrimBox/BleedBox/ArtBox
-fn update_page_boxes(
-    doc: &mut Document,
-    page_id: ObjectId,
-    new_content_id: ObjectId,
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-    cut: f32,
-) {
-    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(page_id) {
-        d.set("Contents", Object::Reference(new_content_id));
-        d.set("MediaBox", Object::Array(vec![
-            x1.into(),
-            y1.into(),
-            (x2 - cut).into(),
-            y2.into()
-        ]));
-        if d.has(b"CropBox") {
-            d.set("CropBox", Object::Array(vec![
-                x1.into(),
-                y1.into(),
-                (x2 - cut).into(),
-                y2.into()
-            ]));
-        }
-        d.remove(b"TrimBox");
-        d.remove(b"BleedBox");
-        d.remove(b"ArtBox");
-    }
 }
