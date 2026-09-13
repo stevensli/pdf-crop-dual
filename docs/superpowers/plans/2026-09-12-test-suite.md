@@ -966,7 +966,7 @@ fn 孤立符号是错误() {
 fn 名称与十六进制转义() {
     let v = items("/F1 /Co#6Cor");
     assert!(is_name(&v[0], b"F1"));
-    assert!(is_name(&v[1], b"Cor"));
+    assert!(is_name(&v[1], b"Color")); // C o #6C('l') o r
     // % 是注释起始，终止名称
     let v = items("/A%B");
     assert_eq!(v.len(), 1);
