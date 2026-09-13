@@ -358,9 +358,10 @@ static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// 本进程唯一的临时文件路径
 pub fn tmp_file(name: &str) -> PathBuf {
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir()
-        .join(format!("pdf-crop-dual-test-{}-{}", std::process::id(), n))
-        .join(name)
+    let dir = std::env::temp_dir()
+        .join(format!("pdf-crop-dual-test-{}-{}", std::process::id(), n));
+    std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+    dir.join(name)
 }
 
 /// 运行二进制；返回 (退出码, stdout, stderr)
@@ -449,7 +450,6 @@ pub fn image_xobject(doc: &mut Document, matrix: [f32; 6]) -> ObjectId {
 
 /// 构建页面级 Resources（字体/XObject 条目均为间接引用）
 pub fn page_resources(
-    _doc: &mut Document,
     fonts: &[(&[u8], ObjectId)],
     xobjects: &[(&[u8], ObjectId)],
 ) -> Dictionary {
@@ -498,45 +498,44 @@ pub fn gs_available() -> bool {
 /// gs 渲染单页为 72dpi PGM（1px = 1pt）
 pub fn render_pgm_page(pdf: &Path, page: u32) -> Pgm {
     let out = tmp_file(&format!("p{page}.pgm"));
+    // gs 10.x 对有值参数要求 `=` 形式（空格形式报 undefinedfilename/rangecheck）
     let o = Command::new("gs")
-        .args([
-            "-dNOPAUSE",
-            "-dBATCH",
-            "-dQUIET",
-            "-sDEVICE=pgmraw",
-            "-r72",
-            "-dFirstPage",
-            &page.to_string(),
-            "-dLastPage",
-            &page.to_string(),
-            "-sOutputFile",
-            out.to_str().expect("临时路径非 UTF-8"),
-        ])
+        .args(["-dNOPAUSE", "-dBATCH", "-dQUIET", "-sDEVICE=pgmraw", "-r72"])
+        .arg(format!("-dFirstPage={page}"))
+        .arg(format!("-dLastPage={page}"))
+        .arg(format!("-sOutputFile={}", out.display()))
         .arg(pdf)
         .output()
         .expect("执行 gs 失败");
-    assert!(o.status.success(), "gs 渲染失败: {}", String::from_utf8_lossy(&o.stderr));
-    let data = std::fs::read(&out).expect("读取 PGM 失败");
-    Pgm::parse(&data).expect("解析 PGM 失败")
+    // -dQUIET 下 gs 报错走 stdout，断言信息须双路合并
+    let gs_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "gs 渲染失败: {gs_log}");
+    // gs 打开输出文件失败时可能仍返回 0，须确认文件确实产出且非空
+    let data = std::fs::read(&out).unwrap_or_else(|e| panic!("读取 PGM 失败({e}): {gs_log}"));
+    assert!(!data.is_empty(), "PGM 输出为空: {gs_log}");
+    Pgm::parse(&data).unwrap_or_else(|| panic!("解析 PGM 失败: {gs_log}"))
 }
 
 /// gs 渲染整份 PDF 的文本层（页间以 \f 分隔）
 pub fn render_txt_file(pdf: &Path) -> String {
     let out = tmp_file("full.txt");
     let o = Command::new("gs")
-        .args([
-            "-dNOPAUSE",
-            "-dBATCH",
-            "-dQUIET",
-            "-sDEVICE=txtwrite",
-            "-sOutputFile",
-            out.to_str().expect("临时路径非 UTF-8"),
-        ])
+        .args(["-dNOPAUSE", "-dBATCH", "-dQUIET", "-sDEVICE=txtwrite"])
+        .arg(format!("-sOutputFile={}", out.display()))
         .arg(pdf)
         .output()
         .expect("执行 gs 失败");
-    assert!(o.status.success(), "gs txtwrite 失败: {}", String::from_utf8_lossy(&o.stderr));
-    std::fs::read_to_string(&out).expect("读取文本层失败")
+    let gs_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "gs txtwrite 失败: {gs_log}");
+    std::fs::read_to_string(&out).unwrap_or_else(|e| panic!("读取文本层失败({e}): {gs_log}"))
 }
 
 /// 按 form feed 字符分页（gs txtwrite 页分隔符；末尾若有空段不影响按索引取页）
@@ -592,17 +591,22 @@ impl Pgm {
         let w: usize = next_token(&mut pos)?.parse().ok()?;
         let h: usize = next_token(&mut pos)?.parse().ok()?;
         let maxval: u32 = next_token(&mut pos)?.parse().ok()?;
+        // 仅支持 8 位灰度；w*h 防溢出
+        if maxval > 255 {
+            return None;
+        }
+        let size = w.checked_mul(h)?;
         if pos < data.len() && (data[pos] as char).is_ascii_whitespace() {
             pos += 1;
         }
-        if data.len() < pos + w * h {
+        if data.len() < pos + size {
             return None;
         }
         Some(Pgm {
             width: w,
             height: h,
             maxval,
-            bytes: data[pos..pos + w * h].to_vec(),
+            bytes: data[pos..pos + size].to_vec(),
         })
     }
 
@@ -634,11 +638,12 @@ impl Pgm {
     /// 调用方保证 left_cols/cut 为整数像素（72dpi 下 px == pt）。
     pub fn manual_crop(&self, left_cols: usize, cut: usize) -> Pgm {
         assert!(left_cols + cut <= self.width, "left_cols+cut 超出原宽");
-        let left_end = left_cols * self.height;
-        let right_start = (left_cols + cut) * self.height;
+        // PGM 为行主序：逐行裁剪（保留前 left_cols 列，删去其后 cut 列）
         let mut bytes = Vec::with_capacity((self.width - cut) * self.height);
-        bytes.extend_from_slice(&self.bytes[..left_end]);
-        bytes.extend_from_slice(&self.bytes[right_start..]);
+        for row in self.bytes.chunks_exact(self.width) {
+            bytes.extend_from_slice(&row[..left_cols]);
+            bytes.extend_from_slice(&row[left_cols + cut..]);
+        }
         Pgm {
             width: self.width - cut,
             height: self.height,
@@ -650,7 +655,9 @@ impl Pgm {
 
 // ===================== Content 断言 =====================
 
-/// 操作视图：操作符 + 数值/字符串/名称操作数（便于逐操作断言）
+/// 操作视图：操作符 + 数值/字符串/名称操作数（便于逐操作断言）。
+/// 数组操作数逐元素摊平（如 TJ [(A) -20 (B)] → strs [A,B]、nums [-20]）；
+/// 其他操作数类型（如 Dictionary）仍丢弃
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpView {
     pub op: String,
@@ -667,13 +674,22 @@ pub fn view_ops(content: &Content) -> Vec<OpView> {
             let mut nums = Vec::new();
             let mut strs = Vec::new();
             let mut names = Vec::new();
-            for v in &o.operands {
+            let mut collect = |v: &Object| {
                 match v {
                     Object::Real(f) => nums.push(*f),
                     Object::Integer(i) => nums.push(*i as f32),
                     Object::String(s, _) => strs.push(s.clone()),
                     Object::Name(n) => names.push(n.clone()),
                     _ => {}
+                }
+            };
+            for v in &o.operands {
+                if let Object::Array(items) = v {
+                    for it in items {
+                        collect(it);
+                    }
+                } else {
+                    collect(v);
                 }
             }
             OpView {
@@ -700,15 +716,15 @@ pub fn assert_ops(actual: &Content, expected: &[ExpOp], ctx: &str) {
     assert_eq!(a.len(), expected.len(), "{ctx}: 操作数量不一致");
     for (i, (av, (eop, enums, estrs, enames))) in a.iter().zip(expected.iter()).enumerate() {
         assert_eq!(&av.op, eop, "{ctx}: 第 {i} 个操作符不一致");
-        assert_eq!(av.nums.len(), enums.len(), "{ctx}: 操作 {eop} 数值操作数数量");
+        assert_eq!(av.nums.len(), enums.len(), "{ctx}: 操作 #{i} {eop} 数值操作数数量");
         for (j, (x, y)) in av.nums.iter().zip(enums.iter()).enumerate() {
             assert!(
                 (x - y).abs() < 1e-3,
-                "{ctx}: 操作 {eop} 参数 {j}: 实际 {x} 期望 {y}"
+                "{ctx}: 操作 #{i} {eop} 参数 {j}: 实际 {x} 期望 {y}"
             );
         }
-        assert_eq!(&av.strs, estrs, "{ctx}: 操作 {eop} 字符串操作数不一致");
-        assert_eq!(&av.names, enames, "{ctx}: 操作 {eop} 名称操作数不一致");
+        assert_eq!(&av.strs, estrs, "{ctx}: 操作 #{i} {eop} 字符串操作数不一致");
+        assert_eq!(&av.names, enames, "{ctx}: 操作 #{i} {eop} 名称操作数不一致");
     }
 }
 ```
@@ -1278,7 +1294,7 @@ fn build_font_info缺DescendantFonts() {
 fn resolve_font_id缓存与失败路径() {
     let mut doc = Document::new();
     let f = type1_font(&mut doc, 32, &[500.0]);
-    let res = page_resources(&mut doc, &[(b"F1", f)], &[]);
+    let res = page_resources(&[(b"F1", f)], &[]);
     let mut fonts = HashMap::new();
     assert_eq!(resolve_font_id(&doc, Some(&res), b"F1", &mut fonts), Some(f));
     assert_eq!(fonts.len(), 1);
@@ -1597,7 +1613,7 @@ use pdf_crop_dual::Walk;
 fn doc_with_font() -> (Document, ObjectId) {
     let mut doc = Document::new();
     let f = type1_font(&mut doc, 32, &[500.0, 1000.0]);
-    let res = page_resources(&mut doc, &[(b"F1", f)], &[]);
+    let res = page_resources(&[(b"F1", f)], &[]);
     let res_id = doc.add_object(Object::Dictionary(res));
     (doc, res_id)
 }
@@ -1776,7 +1792,7 @@ fn v追加两点() {
 fn Form按Matrix定位() {
     let mut doc = Document::new();
     let f = form_xobject(&mut doc, b"0 0 100 10 re f", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), Some([0.0, 0.0, 100.0, 10.0]), None);
-    let res = page_resources(&mut doc, &[], &[(b"Fl", f)]);
+    let res = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let iv = walk(&doc, "Fl Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(500.0, 600.0)]);
@@ -1787,7 +1803,7 @@ fn Form按BBox裁剪() {
     let mut doc = Document::new();
     // 内容宽 200，BBox 只给 100 → 裁掉右半
     let f = form_xobject(&mut doc, b"0 0 200 10 re f", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), Some([0.0, 0.0, 100.0, 10.0]), None);
-    let res = page_resources(&mut doc, &[], &[(b"Fl", f)]);
+    let res = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let iv = walk(&doc, "Fl Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(500.0, 600.0)]);
@@ -1797,7 +1813,7 @@ fn Form按BBox裁剪() {
 fn Form无BBox不裁剪() {
     let mut doc = Document::new();
     let f = form_xobject(&mut doc, b"0 0 200 10 re f", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), None, None);
-    let res = page_resources(&mut doc, &[], &[(b"Fl", f)]);
+    let res = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let iv = walk(&doc, "Fl Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(500.0, 700.0)]);
@@ -1807,9 +1823,9 @@ fn Form无BBox不裁剪() {
 fn Form内文本用自身字体() {
     let mut doc = Document::new();
     let ffont = type1_font(&mut doc, 32, &[500.0, 1000.0]);
-    let fres = page_resources(&mut doc, &[(b"F1", ffont)], &[]);
+    let fres = page_resources(&[(b"F1", ffont)], &[]);
     let f = form_xobject(&mut doc, b"BT /F1 10 Tf 10 0 Td (AB) Tj ET", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), None, Some(&fres));
-    let pres = page_resources(&mut doc, &[], &[(b"Fl", f)]);
+    let pres = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(pres));
     let iv = walk(&doc, "Fl Do", Some(res_of(&doc, res_id)));
     // x0 = 500 + 10 = 510，advance = 5 + 10 = 15
@@ -1820,7 +1836,7 @@ fn Form内文本用自身字体() {
 fn Image按单位正方形量测() {
     let mut doc = Document::new();
     let img = image_xobject(&mut doc, [100.0, 0.0, 0.0, 50.0, 600.0, 10.0]);
-    let res = page_resources(&mut doc, &[], &[(b"Im", img)]);
+    let res = page_resources(&[], &[(b"Im", img)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let iv = walk(&doc, "Im Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(600.0, 700.0)]);
@@ -1831,7 +1847,7 @@ fn 同一Form绘制两次只计一次() {
     // seen_forms 固化口径：重复 Do 不重复量测（并集不变，但区间数减半）
     let mut doc = Document::new();
     let f = form_xobject(&mut doc, b"0 0 10 10 re f", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), None, None);
-    let res = page_resources(&mut doc, &[], &[(b"Fl", f)]);
+    let res = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let iv = walk(&doc, "Fl Do Fl Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(500.0, 510.0)]);
@@ -1842,7 +1858,7 @@ fn 同一Form不同位置第二次漏测() {
     // 已知局限固化：第二次 Do（不同 cm 位置）被 seen_forms 阻断
     let mut doc = Document::new();
     let f = form_xobject(&mut doc, b"0 0 10 10 re f", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), None, None);
-    let res = page_resources(&mut doc, &[], &[(b"Fl", f)]);
+    let res = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let iv = walk(&doc, "q 1 0 0 1 200 0 cm Fl Do Q Fl Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(700.0, 710.0)]);
@@ -1863,7 +1879,7 @@ fn build_chain(doc: &mut Document, n: usize) -> ObjectId {
         prev_name = Some(format!("F{k}"));
     }
     let refs: Vec<(&[u8], ObjectId)> = xobjs.iter().map(|(nm, id)| (nm.as_slice(), *id)).collect();
-    let res = page_resources(doc, &[], &refs);
+    let res = page_resources(&[], &refs);
     doc.add_object(Object::Dictionary(res))
 }
 
@@ -1971,7 +1987,7 @@ use pdf_crop_dual::{detect_gap, rewrite_page, Walk};
 fn doc_with_font() -> (Document, ObjectId) {
     let mut doc = Document::new();
     let f = type1_font(&mut doc, 32, &[500.0, 1000.0]);
-    let res = page_resources(&mut doc, &[(b"F1", f)], &[]);
+    let res = page_resources(&[(b"F1", f)], &[]);
     let res_id = doc.add_object(Object::Dictionary(res));
     (doc, res_id)
 }
@@ -2140,7 +2156,7 @@ fn Form_Do分类() {
     let mut doc = Document::new();
     let fl = form_xobject(&mut doc, b"72 0 300 10 re f", None, None, None); // 墨迹 [72,372]
     let fr = form_xobject(&mut doc, b"72 0 300 10 re f", Some([1.0, 0.0, 0.0, 1.0, 504.0, 0.0]), None, None); // 墨迹 [576,876]
-    let res = page_resources(&mut doc, &[], &[(b"FL", fl), (b"FR", fr)]);
+    let res = page_resources(&[], &[(b"FL", fl), (b"FR", fr)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let res = res_of(&doc, res_id);
     // band [424, 524)：FL 右缘 372 < 424 原样；FR 左缘 576 > 524 → q/cm 包裹左移
@@ -2162,7 +2178,7 @@ fn Form_Do分类() {
 fn Form跨带回退() {
     let mut doc = Document::new();
     let f = form_xobject(&mut doc, b"450 0 100 10 re f", None, None, None);
-    let res = page_resources(&mut doc, &[], &[(b"FL", f)]);
+    let res = page_resources(&[], &[(b"FL", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let res = res_of(&doc, res_id);
     // 墨迹 [450,550] 跨 band [424,524)
@@ -2173,7 +2189,7 @@ fn Form跨带回退() {
 fn Form无墨迹原样通过() {
     let mut doc = Document::new();
     let f = form_xobject(&mut doc, b"q Q", None, None, None);
-    let res = page_resources(&mut doc, &[], &[(b"FE", f)]);
+    let res = page_resources(&[], &[(b"FE", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let res = res_of(&doc, res_id);
     let out = rewrite_page(&doc, b"FE Do", Some(res), 424.0, 100.0).expect("可重写");
@@ -2185,7 +2201,7 @@ fn Image_Do分类() {
     let mut doc = Document::new();
     let il = image_xobject(&mut doc, [100.0, 0.0, 0.0, 50.0, 100.0, 10.0]); // [100,200]
     let ir = image_xobject(&mut doc, [100.0, 0.0, 0.0, 50.0, 620.0, 10.0]); // [620,720]
-    let res = page_resources(&mut doc, &[], &[(b"IL", il), (b"IR", ir)]);
+    let res = page_resources(&[], &[(b"IL", il), (b"IR", ir)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let res = res_of(&doc, res_id);
     let out = rewrite_page(&doc, b"IL Do IR Do", Some(res), 424.0, 100.0).expect("可重写");
@@ -2600,7 +2616,7 @@ fn 重写输出与Walk口径一致() {
     let fl = form_xobject(&mut doc, b"72 0 300 10 re f", None, None, None);
     let fr = form_xobject(&mut doc, b"72 0 300 10 re f", Some([1.0, 0.0, 0.0, 1.0, 504.0, 0.0]), None, None);
     let f = type1_font(&mut doc, 32, &[500.0, 1000.0]);
-    let res = page_resources(&mut doc, &[(b"F1", f)], &[(b"FL", fl), (b"FR", fr)]);
+    let res = page_resources(&[(b"F1", f)], &[(b"FL", fl), (b"FR", fr)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let res = res_of(&doc, res_id);
     let content = b"FL Do FR Do BT /F1 10 Tf 650 500 Tm (AB) Tj ET";
