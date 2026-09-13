@@ -809,14 +809,24 @@ fn mul先应用m1再应用m2() {
 }
 
 #[test]
+fn mul平移先于旋转() {
+    let r90 = Mat::of(0.0, -1.0, 1.0, 0.0, 0.0, 0.0);
+    let m = Mat::mul(Mat::translate(10.0, 30.0), r90);
+    // 先平移：(x+10, y+30)；再按该矩阵映射 (u, v) → (v, -u)：x' = y + 30
+    // e' 中的 m1.f*m2.c 项（30·1）在此首次非零，漏写即失败
+    assert_eq!(m.x_of(0.0, 0.0), 30.0);
+    assert_eq!(m.x_of(1.0, 2.0), 32.0);
+}
+
+#[test]
 fn 平移合成() {
     let m = Mat::mul(Mat::translate(1.0, 2.0), Mat::translate(3.0, 4.0));
-    assert!((m.x_of(0.0, 0.0) - 4.0).abs() < 1e-6);
+    assert_eq!(m.x_of(0.0, 0.0), 4.0);
 }
 
 #[test]
 fn 旋转矩阵交换轴() {
-    // 90° 旋转：(x, y) → (-y, x)，故 x' = y
+    // 90° 旋转（该矩阵实现映射 (x, y) → (y, -x)），故 x' = y
     let m = Mat::of(0.0, -1.0, 1.0, 0.0, 0.0, 0.0);
     assert_eq!(m.x_of(3.0, 7.0), 7.0);
     assert_eq!(m.x_of(-2.0, 5.0), 5.0);
@@ -846,10 +856,19 @@ fn clip钳位跨边区间并剔除区间外者() {
 }
 
 #[test]
+fn clip左缘钳位与左外侧剔除() {
+    // 左缘钳位（a < bx0）、左侧完全在外剔除、框内原样通过、双缘同时钳位
+    let mut iv = vec![(-5.0, 3.0), (-20.0, -5.0), (2.0, 8.0), (-5.0, 100.0)];
+    clip_intervals_to_bbox(&mut iv, 0, 0.0, 10.0);
+    assert_eq!(iv, vec![(0.0, 3.0), (2.0, 8.0), (0.0, 10.0)]);
+}
+
+#[test]
 fn clip只处理mark之后的区间() {
-    let mut iv = vec![(1.0, 2.0), (5.0, 15.0)];
+    // 前缀区间刻意选用裁剪下会变化的形态：忽略 mark（全部裁剪）的实现会失败
+    let mut iv = vec![(5.0, 15.0), (5.0, 15.0)];
     clip_intervals_to_bbox(&mut iv, 1, 0.0, 10.0);
-    assert_eq!(iv, vec![(1.0, 2.0), (5.0, 10.0)]);
+    assert_eq!(iv, vec![(5.0, 15.0), (5.0, 10.0)]);
 }
 
 #[test]
@@ -863,7 +882,7 @@ fn clip退化区间被丢弃() {
 - [ ] **Step 2: 运行测试**
 
 Run: `cargo test --test geometry 2>&1 | tail -8`
-Expected: `test result: ok. 10 passed; 0 failed`（首次运行同时编译 common 模块，验证 Task 2 代码）。
+Expected: `test result: ok. 12 passed; 0 failed`（首次运行同时编译 common 模块，验证 Task 2 代码）。
 
 - [ ] **Step 3: Commit**
 
@@ -3487,7 +3506,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - [ ] **Step 1: 全量测试**
 
 Run: `cargo test 2>&1 | grep -E "^test result|running" | tail -20`
-Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `10 passed; 1 ignored`），合计 143 个测试（10+13+12+9+7+35+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
+Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `10 passed; 1 ignored`），合计 145 个测试（12+13+12+9+7+35+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
 
 - [ ] **Step 2: 深检（全 74 页逐像素）**
 
