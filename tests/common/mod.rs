@@ -1,3 +1,4 @@
+#![allow(dead_code)] // 各测试目标仅用本模块部分助手，未用项不告警
 //! 共享测试助手：合成 PDF 文档构造器、二进制运行、gs 渲染、PGM 解析、文本层计数、操作断言。
 //! 本目录（common/）不会被 cargo 当作独立测试目标，仅作为各测试文件的子模块。
 
@@ -174,7 +175,7 @@ pub fn render_pgm_page(pdf: &Path, page: u32) -> Pgm {
     Pgm::parse(&data).unwrap_or_else(|| panic!("解析 PGM 失败: {gs_log}"))
 }
 
-/// gs 渲染整份 PDF 的文本层（页间以 \f 分隔）
+/// gs 渲染整份 PDF 的文本层（gs 10.x 无页分隔符，逐页定位用 render_txt_page）
 pub fn render_txt_file(pdf: &Path) -> String {
     let out = tmp_file("full.txt");
     let o = Command::new("gs")
@@ -192,9 +193,24 @@ pub fn render_txt_file(pdf: &Path) -> String {
     std::fs::read_to_string(&out).unwrap_or_else(|e| panic!("读取文本层失败({e}): {gs_log}"))
 }
 
-/// 按 form feed 字符分页（gs txtwrite 页分隔符；末尾若有空段不影响按索引取页）
-pub fn split_pages(s: &str) -> Vec<&str> {
-    s.split('\u{0c}').collect()
+/// gs 渲染单页文本层（-dFirstPage/-dLastPage 限定单页，用于逐页定位）
+pub fn render_txt_page(pdf: &Path, page: u32) -> String {
+    let out = tmp_file(&format!("tp{page}.txt"));
+    let o = Command::new("gs")
+        .args(["-dNOPAUSE", "-dBATCH", "-dQUIET", "-sDEVICE=txtwrite"])
+        .arg(format!("-dFirstPage={page}"))
+        .arg(format!("-dLastPage={page}"))
+        .arg(format!("-sOutputFile={}", out.display()))
+        .arg(pdf)
+        .output()
+        .expect("执行 gs 失败");
+    let gs_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(o.status.success(), "gs 单页 txtwrite 失败: {gs_log}");
+    std::fs::read_to_string(&out).unwrap_or_else(|e| panic!("读取单页文本层失败({e}): {gs_log}"))
 }
 
 /// 文本层码点数：过滤 [ \t\r\n\x00-\x1f]（即 U+00..=U+20）后数 UTF-8 码点
