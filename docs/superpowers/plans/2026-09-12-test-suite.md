@@ -863,7 +863,7 @@ fn clip退化区间被丢弃() {
 - [ ] **Step 2: 运行测试**
 
 Run: `cargo test --test geometry 2>&1 | tail -8`
-Expected: `test result: ok. 9 passed; 0 failed`（首次运行同时编译 common 模块，验证 Task 2 代码）。
+Expected: `test result: ok. 10 passed; 0 failed`（首次运行同时编译 common 模块，验证 Task 2 代码）。
 
 - [ ] **Step 3: Commit**
 
@@ -3487,7 +3487,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - [ ] **Step 1: 全量测试**
 
 Run: `cargo test 2>&1 | grep -E "^test result|running" | tail -20`
-Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `10 passed; 1 ignored`），合计 142 个测试（9+13+12+9+7+35+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
+Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `10 passed; 1 ignored`），合计 143 个测试（10+13+12+9+7+35+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
 
 - [ ] **Step 2: 深检（全 74 页逐像素）**
 
