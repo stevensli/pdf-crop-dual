@@ -1131,6 +1131,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```rust
 //! 字体宽度解析与文本 advance 单元测试
+#![allow(non_snake_case)]
+
 
 mod common;
 
