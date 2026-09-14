@@ -929,16 +929,23 @@ fn parse(data: &str) -> Parsed {
     tk.parse_val()
 }
 
-fn is_num(it: &Item, v: f32) -> bool {
-    matches!(it, Item::Val(Val::Num(n)) if (n - v).abs() < 1e-6)
+fn val(it: &Item) -> &Val {
+    match it {
+        Item::Val(v) => v,
+        Item::Op(_) => panic!("期望 Val，实际是 Op"),
+    }
 }
 
-fn is_name(it: &Item, v: &[u8]) -> bool {
-    matches!(it, Item::Val(Val::Name(n)) if n == v)
+fn is_num(v: &Val, x: f32) -> bool {
+    matches!(v, Val::Num(n) if (n - x).abs() < 1e-6)
 }
 
-fn is_str(it: &Item, v: &[u8]) -> bool {
-    matches!(it, Item::Val(Val::Str(s)) if s == v)
+fn is_name(v: &Val, n: &[u8]) -> bool {
+    matches!(v, Val::Name(x) if x == n)
+}
+
+fn is_str(v: &Val, s: &[u8]) -> bool {
+    matches!(v, Val::Str(x) if x == s)
 }
 
 fn is_op(it: &Item, v: &str) -> bool {
@@ -950,7 +957,7 @@ fn 数字形式() {
     let v = items("123 -4.5 +7 .25 3.");
     assert_eq!(v.len(), 5);
     for (i, x) in v.iter().zip([123.0, -4.5, 7.0, 0.25, 3.0]) {
-        assert!(is_num(i, x), "数字解析错误: {i:?} != {x}");
+        assert!(is_num(val(i), x), "数字解析错误: {:?} != {x}", val(i));
     }
 }
 
@@ -965,12 +972,12 @@ fn 孤立符号是错误() {
 #[test]
 fn 名称与十六进制转义() {
     let v = items("/F1 /Co#6Cor");
-    assert!(is_name(&v[0], b"F1"));
-    assert!(is_name(&v[1], b"Color")); // C o #6C('l') o r
+    assert!(is_name(val(&v[0]), b"F1"));
+    assert!(is_name(val(&v[1]), b"Color")); // C o #6C('l') o r
     // % 是注释起始，终止名称
     let v = items("/A%B");
     assert_eq!(v.len(), 1);
-    assert!(is_name(&v[0], b"A"));
+    assert!(is_name(val(&v[0]), b"A"));
 }
 
 #[test]
@@ -996,7 +1003,7 @@ fn 字面量串行续() {
 
 #[test]
 fn 字面量串嵌套括号() {
-    assert!(matches!(parse("(a(b)c)"), Parsed::Val(Val::Str(s)) if s == b"(a(b)c)"));
+    assert!(matches!(parse("(a(b)c)"), Parsed::Val(Val::Str(s)) if s == b"a(b)c"));
 }
 
 #[test]
@@ -1047,7 +1054,7 @@ fn 字典整体跳过且位置正确() {
 fn 注释() {
     let v = items("% c\n1");
     assert_eq!(v.len(), 1);
-    assert!(is_num(&v[0], 1.0));
+    assert!(is_num(val(&v[0]), 1.0));
     // 文件尾无换行注释
     assert_eq!(items("1 % trailing comment").len(), 1);
 }
@@ -1056,10 +1063,10 @@ fn 注释() {
 fn 混合流顺序() {
     let v = items("1.5 -2 /F1 (abc) [1 2 3] BT");
     assert_eq!(v.len(), 6);
-    assert!(is_num(&v[0], 1.5));
-    assert!(is_num(&v[1], -2.0));
-    assert!(is_name(&v[2], b"F1"));
-    assert!(is_str(&v[3], b"abc"));
+    assert!(is_num(val(&v[0]), 1.5));
+    assert!(is_num(val(&v[1]), -2.0));
+    assert!(is_name(val(&v[2]), b"F1"));
+    assert!(is_str(val(&v[3]), b"abc"));
     assert!(matches!(&v[4], Item::Val(Val::Arr(a)) if a.len() == 3));
     assert!(is_op(&v[5], "BT"));
 }
