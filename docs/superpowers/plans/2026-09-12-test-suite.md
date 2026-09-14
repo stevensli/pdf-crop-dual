@@ -1777,17 +1777,22 @@ fn Tc每字形累加() {
 
 #[test]
 fn Tz仅对空格生效() {
-    // A: 5, 空格: 5+100/100*2 = 7, B: 10 → 22（Tw 仅经空格 Tz 项生效）
+    // A: 5, 空格: 5+200/100*2 = 9, B: 10 → 24（Tz 系数 tz/100，Tw 仅经空格项生效）
     let (doc, res_id) = doc_with_font();
-    let iv = walk(&doc, "BT /F1 10 Tf 2 Tw 100 500 Td (A B) Tj ET", Some(res_of(&doc, res_id)));
-    assert_eq!(iv, vec![(100.0, 122.0)]);
+    let iv = walk(&doc, "BT /F1 10 Tf 2 Tw 200 Tz 100 500 Td (A B) Tj ET", Some(res_of(&doc, res_id)));
+    assert_eq!(iv, vec![(100.0, 124.0)]);
 }
 
 #[test]
 fn BT外的文本操作被忽略() {
+    // 第二个 BT 块验证 BT 重置 tlm：不继承第一块行矩阵（e 回到 200 而非叠加到 300）
     let (doc, res_id) = doc_with_font();
-    let iv = walk(&doc, "BT /F1 10 Tf 100 500 Td (A) Tj ET 200 0 Td (B) Tj", Some(res_of(&doc, res_id)));
-    assert_eq!(iv, vec![(100.0, 105.0)]);
+    let iv = walk(
+        &doc,
+        "BT /F1 10 Tf 100 500 Td (A) Tj ET 200 0 Td (B) Tj BT /F1 10 Tf 200 500 Td (B) Tj ET",
+        Some(res_of(&doc, res_id)),
+    );
+    assert_eq!(iv, vec![(100.0, 105.0), (200.0, 210.0)]);
 }
 
 // ===================== 路径 =====================
@@ -2014,7 +2019,7 @@ fn 未知操作被忽略() {
 #[test]
 fn Do未知名称被忽略() {
     let (doc, res_id) = doc_with_font();
-    let iv = walk(&doc, "Missing Do 0 0 10 10 re f", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "/Missing Do 0 0 10 10 re f", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(0.0, 10.0)]);
 }
 
@@ -2023,7 +2028,7 @@ fn 无Resources时Do不生效() {
     let mut doc = Document::new();
     let f = form_xobject(&mut doc, b"0 0 10 10 re f", None, None, None);
     let _ = f;
-    let iv = walk(&doc, "Fl Do 5 0 m 6 0 l S", None);
+    let iv = walk(&doc, "/Fl Do 5 0 m 6 0 l S", None);
     assert_eq!(iv, vec![(5.0, 6.0)]);
 }
 ```
