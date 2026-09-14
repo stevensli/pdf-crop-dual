@@ -2043,6 +2043,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```rust
 //! rewrite_page 格式保留式重写单元测试（分类、文本移位修正、Form/Image、回退、与 Walk 一致性）
+#![allow(non_snake_case)]
+
 
 mod common;
 
