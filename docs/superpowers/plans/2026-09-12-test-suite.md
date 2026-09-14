@@ -1523,7 +1523,7 @@ fn page_resources_dict三种情形() {
         Dictionary::new(),
     );
     let d1 = doc.get_object(p1).unwrap().as_dict().unwrap();
-    assert!(page_resources_dict(&doc, d1, p1).is_some());
+    assert!(page_resources_dict(&doc, d1, p1).unwrap().has(b"Font"));
     // 间接引用
     let res_id = doc.add_object(Object::Dictionary(dictionary! { "Font" => dictionary! {} }));
     let (p2, _) = page_tree(
@@ -1532,7 +1532,7 @@ fn page_resources_dict三种情形() {
         Dictionary::new(),
     );
     let d2 = doc.get_object(p2).unwrap().as_dict().unwrap();
-    assert!(page_resources_dict(&doc, d2, p2).is_some());
+    assert!(page_resources_dict(&doc, d2, p2).unwrap().has(b"Font"));
     // 缺失
     let (p3, _) = page_tree(&mut doc, dictionary! { "Type" => "Page" }, Dictionary::new());
     let d3 = doc.get_object(p3).unwrap().as_dict().unwrap();
