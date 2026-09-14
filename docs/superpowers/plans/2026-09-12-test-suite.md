@@ -2745,6 +2745,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```rust
 //! 自 main.rs 迁入 lib 的纯逻辑函数与重写工具函数单元测试
+#![allow(non_snake_case)]
+
 
 mod common;
 
