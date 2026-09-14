@@ -3129,7 +3129,7 @@ fn xobject_keys(doc: &Document, page_id: ObjectId) -> BTreeSet<Vec<u8>> {
         },
         _ => return BTreeSet::new(),
     };
-    xo.keys().cloned().collect()
+    xo.iter().map(|(k, _)| k.clone()).collect()
 }
 
 /// 回退页新 Contents 断言：恰好 2 个 Do /FormXn、1 个 cm（e=-cut）、右半 W 在 cm 之前
@@ -3192,7 +3192,8 @@ fn assert_fallback_content(doc: &Document, page_id: ObjectId, form_name: &[u8], 
 #[test]
 fn cli_参数错误() {
     let s = test_pdf().to_str().unwrap();
-    let out = tmp_file("err.pdf").to_str().unwrap();
+    let out_path = tmp_file("err.pdf");
+    let out = out_path.to_str().unwrap();
     // 无参
     let (code, _stdout, stderr) = run_tool(&[]);
     assert_eq!(code, 1);
@@ -3278,7 +3279,8 @@ fn e2e_格式保留结构() {
     let out_doc = Document::load(&out).expect("加载输出 PDF");
     let in_pages = in_doc.get_pages();
     let out_pages = out_doc.get_pages();
-    assert_eq!(in_pages.len(), out_pages.len(), 74);
+    assert_eq!(in_pages.len(), 74);
+    assert_eq!(in_pages.len(), out_pages.len());
     let gaps = page_gaps(&in_doc);
     let mut n_gap = 0usize;
     let mut n_fb = 0usize;
