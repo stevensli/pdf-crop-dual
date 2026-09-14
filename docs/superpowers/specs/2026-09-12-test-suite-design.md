@@ -108,7 +108,7 @@ tests/
 - 数组：嵌套 `[1 2.5 (s) /n [3]]`；数组内裸词/字典被丢弃（`[BT 1]` → `[Num(1)]`）。
 - 字典跳过：`<< /A 1 /B [1 2] /C (x) /D 5 0 R >>` → `DictSkipped` 且后续 token 位置正确；空字典 `<< >>`。
 - 注释：`% c\n1` → `Num(1)`；文件尾无换行注释。
-- 内联图像：`BI /Width 1 /Length 4 ID\nwxyz\nEI S`：首个 item 为 `Op("BI")`，`handle_inline_image()` 返回 true，随后 `next_item` 为 `Op("S")`；`ID` 后 `<CRLF>` 变体；缺 `EI` / Length 越界 → false。
+- 内联图像：`BI << /Width 1 /Length 4 >> ID\nwxyz\nEI S`：首个 item 为 `Op("BI")`，`handle_inline_image()` 返回 true，随后 `next_item` 为 `Op("S")`；`ID` 后 `<CRLF>` 变体；缺 `EI` / Length 越界 → false。
 
 ### fonts.rs
 - `str_advance` 无字体：每字节 1em（`len * tfs`）。

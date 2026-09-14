@@ -1390,7 +1390,7 @@ fn real_vec(xs: &[f32]) -> Object {
 }
 
 fn int_vec(xs: &[i32]) -> Object {
-    Object::Array(xs.iter().map(|x| Object::Integer(*x)).collect())
+    Object::Array(xs.iter().map(|x| Object::Integer(*x as i64)).collect())
 }
 
 #[test]
@@ -1646,10 +1646,15 @@ use common::{form_xobject, image_xobject, page_resources, type1_font};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use pdf_crop_dual::Walk;
 
-/// 含 F1 字体的文档：FirstChar=32, Widths=[500, 1000] → @10pt 'A'=5pt, 'B'=10pt
+/// 含 F1 字体的文档：FirstChar=32，Widths 覆盖码字 32..=66
+/// （空格=500、'A'=500、'B'=1000、其余 0）→ @10pt 'A'=5pt, 'B'=10pt
 fn doc_with_font() -> (Document, ObjectId) {
     let mut doc = Document::new();
-    let f = type1_font(&mut doc, 32, &[500.0, 1000.0]);
+    let mut widths = vec![0.0f32; 35];
+    widths[0] = 500.0; // 空格（码字 32）
+    widths[33] = 500.0; // 'A'（码字 65）
+    widths[34] = 1000.0; // 'B'（码字 66）
+    let f = type1_font(&mut doc, 32, &widths);
     let res = page_resources(&[(b"F1", f)], &[]);
     let res_id = doc.add_object(Object::Dictionary(res));
     (doc, res_id)
@@ -1679,7 +1684,7 @@ fn 文本无字体按1em() {
 fn 文本Tm绝对定位() {
     // 'A' = 500@12pt = 6
     let (doc, res_id) = doc_with_font();
-    let iv = walk(&doc, "BT /F1 12 Tf 200 100 Tm (A) Tj ET", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "BT /F1 12 Tf 1 0 0 1 200 100 Tm (A) Tj ET", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(200.0, 206.0)]);
 }
 
@@ -1694,7 +1699,7 @@ fn Td偏移在文本空间经Tm缩放() {
 #[test]
 fn Td叠加在Tm之后() {
     let (doc, res_id) = doc_with_font();
-    let iv = walk(&doc, "BT /F1 10 Tf 100 500 Tm 50 0 Td (A) Tj ET", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "BT /F1 10 Tf 1 0 0 1 100 500 Tm 50 0 Td (A) Tj ET", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(150.0, 155.0)]);
 }
 
@@ -1731,10 +1736,11 @@ fn TJ数组缩进计入() {
 }
 
 #[test]
-fn Tw每字形累加() {
+fn Tw不额外加到非空格字形() {
+    // 项目口径：str_advance 仅空格按 Tz/100·Tw 加宽，Tw 不逐字形累加
     let (doc, res_id) = doc_with_font();
     let iv = walk(&doc, "BT /F1 10 Tf 2 Tw 100 500 Td (AB) Tj ET", Some(res_of(&doc, res_id)));
-    assert_eq!(iv, vec![(100.0, 119.0)]);
+    assert_eq!(iv, vec![(100.0, 115.0)]);
 }
 
 #[test]
@@ -1746,10 +1752,10 @@ fn Tc每字形累加() {
 
 #[test]
 fn Tz仅对空格生效() {
-    // A: 5+2, 空格: 5+2+100/100*2, B: 10+2 → 28
+    // A: 5, 空格: 5+100/100*2 = 7, B: 10 → 22（Tw 仅经空格 Tz 项生效）
     let (doc, res_id) = doc_with_font();
     let iv = walk(&doc, "BT /F1 10 Tf 2 Tw 100 500 Td (A B) Tj ET", Some(res_of(&doc, res_id)));
-    assert_eq!(iv, vec![(100.0, 128.0)]);
+    assert_eq!(iv, vec![(100.0, 122.0)]);
 }
 
 #[test]
@@ -1812,14 +1818,14 @@ fn m重置路径仅保留最后子路径() {
 #[test]
 fn 曲线控制点计入范围() {
     let (doc, _) = doc_with_font();
-    let iv = walk(&doc, "5 0 m 10 20 c 20 30 30 0 f", None);
+    let iv = walk(&doc, "5 0 m 10 20 20 30 30 0 c f", None);
     assert_eq!(iv, vec![(5.0, 30.0)]);
 }
 
 #[test]
 fn v追加两点() {
     let (doc, _) = doc_with_font();
-    let iv = walk(&doc, "0 0 m 10 20 v 30 0 f", None);
+    let iv = walk(&doc, "0 0 m 10 20 30 0 v f", None);
     assert_eq!(iv, vec![(0.0, 30.0)]);
 }
 
@@ -1831,7 +1837,7 @@ fn Form按Matrix定位() {
     let f = form_xobject(&mut doc, b"0 0 100 10 re f", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), Some([0.0, 0.0, 100.0, 10.0]), None);
     let res = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
-    let iv = walk(&doc, "Fl Do", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "/Fl Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(500.0, 600.0)]);
 }
 
@@ -1842,7 +1848,7 @@ fn Form按BBox裁剪() {
     let f = form_xobject(&mut doc, b"0 0 200 10 re f", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), Some([0.0, 0.0, 100.0, 10.0]), None);
     let res = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
-    let iv = walk(&doc, "Fl Do", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "/Fl Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(500.0, 600.0)]);
 }
 
@@ -1852,19 +1858,21 @@ fn Form无BBox不裁剪() {
     let f = form_xobject(&mut doc, b"0 0 200 10 re f", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), None, None);
     let res = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
-    let iv = walk(&doc, "Fl Do", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "/Fl Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(500.0, 700.0)]);
 }
 
 #[test]
 fn Form内文本用自身字体() {
     let mut doc = Document::new();
-    let ffont = type1_font(&mut doc, 32, &[500.0, 1000.0]);
+    let mut fw = vec![0.0f32; 35];
+    fw[0] = 500.0; fw[33] = 500.0; fw[34] = 1000.0;
+    let ffont = type1_font(&mut doc, 32, &fw);
     let fres = page_resources(&[(b"F1", ffont)], &[]);
     let f = form_xobject(&mut doc, b"BT /F1 10 Tf 10 0 Td (AB) Tj ET", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), None, Some(&fres));
     let pres = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(pres));
-    let iv = walk(&doc, "Fl Do", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "/Fl Do", Some(res_of(&doc, res_id)));
     // x0 = 500 + 10 = 510，advance = 5 + 10 = 15
     assert_eq!(iv, vec![(510.0, 525.0)]);
 }
@@ -1875,7 +1883,7 @@ fn Image按单位正方形量测() {
     let img = image_xobject(&mut doc, [100.0, 0.0, 0.0, 50.0, 600.0, 10.0]);
     let res = page_resources(&[], &[(b"Im", img)]);
     let res_id = doc.add_object(Object::Dictionary(res));
-    let iv = walk(&doc, "Im Do", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "/Im Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(600.0, 700.0)]);
 }
 
@@ -1886,7 +1894,7 @@ fn 同一Form绘制两次只计一次() {
     let f = form_xobject(&mut doc, b"0 0 10 10 re f", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), None, None);
     let res = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
-    let iv = walk(&doc, "Fl Do Fl Do", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "/Fl Do /Fl Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(500.0, 510.0)]);
 }
 
@@ -1897,23 +1905,30 @@ fn 同一Form不同位置第二次漏测() {
     let f = form_xobject(&mut doc, b"0 0 10 10 re f", Some([1.0, 0.0, 0.0, 1.0, 500.0, 0.0]), None, None);
     let res = page_resources(&[], &[(b"Fl", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
-    let iv = walk(&doc, "q 1 0 0 1 200 0 cm Fl Do Q Fl Do", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "q 1 0 0 1 200 0 cm /Fl Do Q /Fl Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(700.0, 710.0)]);
 }
 
-/// 构建 n 层 Form 链：F1 内 "F2 Do" … Fn 内矩形（均无 Matrix/BBox），返回页面 resources 对象 id
+/// 构建 n 层 Form 链：F1 内 "/F2 Do" … Fn 内矩形（均无 Matrix/BBox），返回页面 resources 对象 id。
+/// 每层 Form 自带 Resources 指向下一层（Do 的名字解析依赖当前层 Resources）
 fn build_chain(doc: &mut Document, n: usize) -> ObjectId {
     let mut xobjs: Vec<(Vec<u8>, ObjectId)> = Vec::new();
-    let mut prev_name: Option<String> = None;
+    let mut prev: Option<(String, ObjectId)> = None;
     for k in (1..=n).rev() {
-        let content = match &prev_name {
-            Some(p) => format!("{p} Do").into_bytes(),
-            None => b"0 0 10 10 re f".to_vec(),
+        let (content, resources) = match &prev {
+            Some((p, pid)) => {
+                let mut xo = Dictionary::new();
+                xo.set(p.as_bytes().to_vec(), Object::Reference(*pid));
+                let mut r = Dictionary::new();
+                r.set("XObject", Object::Dictionary(xo));
+                (format!("/{p} Do").into_bytes(), Some(r))
+            }
+            None => (b"0 0 10 10 re f".to_vec(), None),
         };
-        let id = form_xobject(doc, &content, None, None, None);
-        let name = format!("F{k}").into_bytes();
-        xobjs.push((name, id));
-        prev_name = Some(format!("F{k}"));
+        let id = form_xobject(doc, &content, None, None, resources.as_ref());
+        let name = format!("F{k}");
+        xobjs.push((name.clone().into_bytes(), id));
+        prev = Some((name, id));
     }
     let refs: Vec<(&[u8], ObjectId)> = xobjs.iter().map(|(nm, id)| (nm.as_slice(), *id)).collect();
     let res = page_resources(&[], &refs);
@@ -1925,7 +1940,7 @@ fn Form链8层计入() {
     let mut doc = Document::new();
     let res_id = build_chain(&mut doc, 8);
     // walk_form 在 depth 0..7 放行，第 8 层矩形被量测
-    let iv = walk(&doc, "F1 Do", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "/F1 Do", Some(res_of(&doc, res_id)));
     assert_eq!(iv, vec![(0.0, 10.0)]);
 }
 
@@ -1934,7 +1949,7 @@ fn Form链9层被阻断() {
     let mut doc = Document::new();
     let res_id = build_chain(&mut doc, 9);
     // depth 8 达到上限，最内层矩形漏测
-    let iv = walk(&doc, "F1 Do", Some(res_of(&doc, res_id)));
+    let iv = walk(&doc, "/F1 Do", Some(res_of(&doc, res_id)));
     assert!(iv.is_empty());
 }
 
@@ -1943,7 +1958,7 @@ fn Form链9层被阻断() {
 #[test]
 fn 内联图像被跳过且不计区间() {
     let (doc, _) = doc_with_font();
-    let content = "0 0 10 10 re f BI /Length 4 ID\nabcd EI 200 0 10 10 re f";
+    let content = "0 0 10 10 re f BI << /Length 4 >> ID\nabcd EI 200 0 10 10 re f";
     let iv = walk(&doc, content, None);
     assert_eq!(iv, vec![(0.0, 10.0), (200.0, 210.0)]);
 }
@@ -1951,7 +1966,7 @@ fn 内联图像被跳过且不计区间() {
 #[test]
 fn 内联图像缺Length使遍历中止() {
     let (doc, _) = doc_with_font();
-    let content = "0 0 10 10 re f BI /W 4 ID\nabcd EI 200 0 10 10 re f";
+    let content = "0 0 10 10 re f BI << /W 4 >> ID\nabcd EI 200 0 10 10 re f";
     let iv = walk(&doc, content, None);
     assert_eq!(iv, vec![(0.0, 10.0)]);
 }
@@ -1967,7 +1982,7 @@ fn 损坏字符串使遍历中止() {
 #[test]
 fn 未知操作被忽略() {
     let (doc, _) = doc_with_font();
-    let iv = walk(&doc, "foo 1 2 3 0 0 10 10 re f", None);
+    let iv = walk(&doc, "foo 0 0 10 10 re f", None);
     assert_eq!(iv, vec![(0.0, 10.0)]);
 }
 
@@ -2020,10 +2035,15 @@ use common::{assert_ops, eo, form_xobject, image_xobject, page_resources, type1_
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use pdf_crop_dual::{detect_gap, rewrite_page, Walk};
 
-/// 含 F1 字体：FirstChar=32, Widths=[500, 1000] → @10pt 'A'=5pt, 'B'=10pt
+/// 含 F1 字体：FirstChar=32，Widths 覆盖码字 32..=66
+/// （空格=500、'A'=500、'B'=1000、其余 0）→ @10pt 'A'=5pt, 'B'=10pt
 fn doc_with_font() -> (Document, ObjectId) {
     let mut doc = Document::new();
-    let f = type1_font(&mut doc, 32, &[500.0, 1000.0]);
+    let mut widths = vec![0.0f32; 35];
+    widths[0] = 500.0; // 空格（码字 32）
+    widths[33] = 500.0; // 'A'（码字 65）
+    widths[34] = 1000.0; // 'B'（码字 66）
+    let f = type1_font(&mut doc, 32, &widths);
     let res = page_resources(&[(b"F1", f)], &[]);
     let res_id = doc.add_object(Object::Dictionary(res));
     (doc, res_id)
@@ -2060,7 +2080,7 @@ fn 左侧原样右侧左移() {
 fn 右侧Tm原点仅取CTM逆修正() {
     let (doc, res_id) = doc_with_font();
     let res = res_of(&doc, res_id);
-    let out = rewrite_page(&doc, b"BT /F1 10 Tf 650 500 Tm (AB) Tj ET", Some(res), 500.0, 100.0)
+    let out = rewrite_page(&doc, b"BT /F1 10 Tf 1 0 0 1 650 500 Tm (AB) Tj ET", Some(res), 500.0, 100.0)
         .expect("可重写");
     // 发射 Tm 的 e = 650 - 100 = 550；内部状态仍按原位置校验
     assert_ops(
@@ -2080,7 +2100,7 @@ fn 右侧Tm原点仅取CTM逆修正() {
 fn Td从左跨到右() {
     let (doc, res_id) = doc_with_font();
     let res = res_of(&doc, res_id);
-    let out = rewrite_page(&doc, b"BT /F1 10 Tf 100 500 Tm 520 0 Td (A) Tj ET", Some(res), 500.0, 100.0)
+    let out = rewrite_page(&doc, b"BT /F1 10 Tf 1 0 0 1 100 500 Tm 520 0 Td (A) Tj ET", Some(res), 500.0, 100.0)
         .expect("可重写");
     // 新位置 620（右）、前位置 100（左）：δ = -cut → 发射 520 - 100 = 420
     assert_ops(
@@ -2101,7 +2121,7 @@ fn Td从左跨到右() {
 fn Td从右跨到左() {
     let (doc, res_id) = doc_with_font();
     let res = res_of(&doc, res_id);
-    let out = rewrite_page(&doc, b"BT /F1 10 Tf 650 500 Tm -520 0 Td (A) Tj ET", Some(res), 500.0, 100.0)
+    let out = rewrite_page(&doc, b"BT /F1 10 Tf 1 0 0 1 650 500 Tm -520 0 Td (A) Tj ET", Some(res), 500.0, 100.0)
         .expect("可重写");
     // Tm 发射 e=550；新位置 130（左）、前位置 650（右）：δ = +cut → 发射 -520 + 100 = -420
     assert_ops(
@@ -2125,7 +2145,7 @@ fn 文本跨带回退() {
     // 无字体信息：'A'+'B' = 20 → [490, 510] 跨移除带
     assert!(rewrite_page(
         &doc,
-        b"BT /F9 10 Tf 490 500 Tm (AB) Tj ET",
+        b"BT /F9 10 Tf 1 0 0 1 490 500 Tm (AB) Tj ET",
         Some(res),
         500.0,
         100.0
@@ -2197,7 +2217,7 @@ fn Form_Do分类() {
     let res_id = doc.add_object(Object::Dictionary(res));
     let res = res_of(&doc, res_id);
     // band [424, 524)：FL 右缘 372 < 424 原样；FR 左缘 576 > 524 → q/cm 包裹左移
-    let out = rewrite_page(&doc, b"FL Do FR Do", Some(res), 424.0, 100.0).expect("可重写");
+    let out = rewrite_page(&doc, b"/FL Do /FR Do", Some(res), 424.0, 100.0).expect("可重写");
     assert_ops(
         &out,
         &[
@@ -2219,7 +2239,7 @@ fn Form跨带回退() {
     let res_id = doc.add_object(Object::Dictionary(res));
     let res = res_of(&doc, res_id);
     // 墨迹 [450,550] 跨 band [424,524)
-    assert!(rewrite_page(&doc, b"FL Do", Some(res), 424.0, 100.0).is_none());
+    assert!(rewrite_page(&doc, b"/FL Do", Some(res), 424.0, 100.0).is_none());
 }
 
 #[test]
@@ -2229,7 +2249,7 @@ fn Form无墨迹原样通过() {
     let res = page_resources(&[], &[(b"FE", f)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let res = res_of(&doc, res_id);
-    let out = rewrite_page(&doc, b"FE Do", Some(res), 424.0, 100.0).expect("可重写");
+    let out = rewrite_page(&doc, b"/FE Do", Some(res), 424.0, 100.0).expect("可重写");
     assert_ops(&out, &[("Do", vec![], vec![], vec![b"FE".to_vec()])], "空墨迹 Form");
 }
 
@@ -2241,7 +2261,7 @@ fn Image_Do分类() {
     let res = page_resources(&[], &[(b"IL", il), (b"IR", ir)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let res = res_of(&doc, res_id);
-    let out = rewrite_page(&doc, b"IL Do IR Do", Some(res), 424.0, 100.0).expect("可重写");
+    let out = rewrite_page(&doc, b"/IL Do /IR Do", Some(res), 424.0, 100.0).expect("可重写");
     assert_ops(
         &out,
         &[
@@ -2445,7 +2465,7 @@ fn 不支持语法回退() {
 fn Do未知XObject原样通过() {
     let (doc, res_id) = doc_with_font();
     let res = res_of(&doc, res_id);
-    let out = rewrite_page(&doc, b"FMiss Do", Some(res), 500.0, 100.0).expect("可重写");
+    let out = rewrite_page(&doc, b"/FMiss Do", Some(res), 500.0, 100.0).expect("可重写");
     assert_ops(&out, &[("Do", vec![], vec![], vec![b"FMiss".to_vec()])], "未知 XObject");
 }
 
@@ -2453,7 +2473,7 @@ fn Do未知XObject原样通过() {
 fn Td同侧不变() {
     let (doc, res_id) = doc_with_font();
     let res = res_of(&doc, res_id);
-    let out = rewrite_page(&doc, b"BT /F1 10 Tf 650 500 Tm 10 0 Td (A) Tj ET", Some(res), 500.0, 100.0)
+    let out = rewrite_page(&doc, b"BT /F1 10 Tf 1 0 0 1 650 500 Tm 10 0 Td (A) Tj ET", Some(res), 500.0, 100.0)
         .expect("可重写");
     // 新位置 660（右）、前位置 650（右）→ delta=0，Td 操作数不变
     assert_ops(
@@ -2475,7 +2495,7 @@ fn Td落带内回退() {
     let (doc, res_id) = doc_with_font();
     let res = res_of(&doc, res_id);
     // 新位置 100+400=500 == band_left，不满足严格不等式 → None
-    assert!(rewrite_page(&doc, b"BT /F1 10 Tf 100 500 Tm 400 0 Td (A) Tj ET", Some(res), 500.0, 100.0)
+    assert!(rewrite_page(&doc, b"BT /F1 10 Tf 1 0 0 1 100 500 Tm 400 0 Td (A) Tj ET", Some(res), 500.0, 100.0)
         .is_none());
 }
 
@@ -2484,7 +2504,7 @@ fn 文本左缘hi严格小于band_left() {
     let (doc, res_id) = doc_with_font();
     let res = res_of(&doc, res_id);
     // 'A'=5pt → [490,495]，hi < 500 → 左侧原样
-    let out = rewrite_page(&doc, b"BT /F1 10 Tf 490 500 Tm (A) Tj ET", Some(res), 500.0, 100.0)
+    let out = rewrite_page(&doc, b"BT /F1 10 Tf 1 0 0 1 490 500 Tm (A) Tj ET", Some(res), 500.0, 100.0)
         .expect("左临界通过");
     assert_ops(
         &out,
@@ -2498,7 +2518,7 @@ fn 文本左缘hi严格小于band_left() {
         "左临界",
     );
     // 无字体信息：'AB' = 2em = 20pt → [480,500]，hi == band_left → 严格不等式不满足 → None
-    assert!(rewrite_page(&doc, b"BT /F9 10 Tf 480 500 Tm (AB) Tj ET", Some(res), 500.0, 100.0)
+    assert!(rewrite_page(&doc, b"BT /F9 10 Tf 1 0 0 1 480 500 Tm (AB) Tj ET", Some(res), 500.0, 100.0)
         .is_none());
 }
 
@@ -2547,7 +2567,7 @@ fn ET必发且块后路径完整() {
     let res = res_of(&doc, res_id);
     let out = rewrite_page(
         &doc,
-        b"BT /F1 10 Tf 650 500 Tm (A) Tj ET 610 300 m 620 300 l S",
+        b"BT /F1 10 Tf 1 0 0 1 650 500 Tm (A) Tj ET 610 300 m 620 300 l S",
         Some(res),
         500.0,
         100.0,
@@ -2575,7 +2595,7 @@ fn 块外文本操作原样通过() {
     let res = res_of(&doc, res_id);
     let out = rewrite_page(
         &doc,
-        b"BT /F1 10 Tf 100 500 Tm (A) Tj ET (B) Tj 610 300 m 620 300 l S",
+        b"BT /F1 10 Tf 1 0 0 1 100 500 Tm (A) Tj ET (B) Tj 610 300 m 620 300 l S",
         Some(res),
         500.0,
         100.0,
@@ -2652,11 +2672,15 @@ fn 重写输出与Walk口径一致() {
     let mut doc = Document::new();
     let fl = form_xobject(&mut doc, b"72 0 300 10 re f", None, None, None);
     let fr = form_xobject(&mut doc, b"72 0 300 10 re f", Some([1.0, 0.0, 0.0, 1.0, 504.0, 0.0]), None, None);
-    let f = type1_font(&mut doc, 32, &[500.0, 1000.0]);
+    let mut widths = vec![0.0f32; 35];
+    widths[0] = 500.0;
+    widths[33] = 500.0;
+    widths[34] = 1000.0;
+    let f = type1_font(&mut doc, 32, &widths);
     let res = page_resources(&[(b"F1", f)], &[(b"FL", fl), (b"FR", fr)]);
     let res_id = doc.add_object(Object::Dictionary(res));
     let res = res_of(&doc, res_id);
-    let content = b"FL Do FR Do BT /F1 10 Tf 650 500 Tm (AB) Tj ET";
+    let content = b"/FL Do /FR Do BT /F1 10 Tf 1 0 0 1 650 500 Tm (AB) Tj ET";
 
     // 第一遍：Walk 量测墨迹，detect_gap 定位空白带
     let mut w = Walk::new(&doc);
@@ -3295,7 +3319,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ### Task 12: tests/e2e.rs —— gs 断言（测试 6-10）
 
 **Files:**
-- Modify: `tests/e2e.rs`（Task 11 已创建；本任务扩充 imports 并追加 4 个 gs 依赖测试）
+- Modify: `tests/e2e.rs`（Task 11 已创建；本任务扩充 imports 并追加 5 个 gs 依赖测试）
 
 **背景**：gs 72dpi 渲染 1px=1pt。核心断言「输出 == 原始页手工裁剪」：spec=100 时 cut 恰为 100pt 整数，空白带内无墨迹且两侧墨迹离 band_left ≥2pt，故逐像素严格成立。gs 缺失时 `gs_available()` 为 false，测试打印说明后直接 return（不失败）。
 
