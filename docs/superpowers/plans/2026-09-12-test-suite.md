@@ -1389,6 +1389,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```rust
 //! get_mediabox / get_resources / page_resources_dict 单元测试
+#![allow(non_snake_case)]
+
 
 mod common;
 
