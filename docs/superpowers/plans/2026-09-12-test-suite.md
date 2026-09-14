@@ -3557,7 +3557,7 @@ Expected：`test result: ok. 1 passed`（`e2e_全部页像素全等`），约 2~
 
 将下面这段旧文本（`## 输出验证方法（像素级 + 文本层）` 整节，从标题到「系统只有 gs，没有 pdftoppm」一条）：
 
-```markdown
+````markdown
 ## 输出验证方法（像素级 + 文本层）
 
 项目无单元测试。验证流程：
@@ -3575,11 +3575,11 @@ gs -dNOPAUSE -dBATCH -sDEVICE=pgmraw -r72 -sOutputFile=/tmp/x-%d.pgm <file.pdf>
   ```
   纯 Python 过滤 `[ \t\r\n\x00-\x1f]` 后数 UTF-8 码点，输出总数应等于原始 PDF（恰好 1×；传统方案的输出是 2×）。逐页比对（`gs -dFirstPage=N -dLastPage=N`）可定位问题页
 - 系统只有 gs，没有 pdftoppm
-```
+````
 
 替换为：
 
-```markdown
+````markdown
 ## 测试与验证
 
 测试全部位于 `tests/` 目录（src/ 内不含测试代码；测试所需的 lib 私有项已加 `pub`，main.rs 的 5 个纯函数已迁入 lib）：
@@ -3592,7 +3592,7 @@ cargo test -- --ignored     # 追加 e2e 全 74 页逐像素深检（约 2~5 分
 - 单元测试：`geometry.rs`（矩阵/裁剪）、`lexer.rs`（词法器）、`fonts.rs`（字体宽度与 advance）、`object_access.rs`（MediaBox/Resources 解析）、`detect_gap.rs`（空白判定）、`walk.rs`（Walk 墨迹区间口径）、`rewrite.rs`（重写器分类/移位/回退）、`main_logic.rs`（收敛算法/传统方案内容流/页面框）
 - 集成测试 `e2e.rs`：CLI 参数与收敛行为、输出页框、格式保留结构（gap 页不新增 XObject、回退页 2 个 Do + 裁剪在 cm 之前）、gs 文本层 1×/2×、gs 像素级「输出 == 原始页手工裁剪」全等；gs 缺失时 gs 依赖项自动跳过
 - 手工验证（调试用）：`gs -dNOPAUSE -dBATCH -sDEVICE=pgmraw -r72 -sOutputFile=/tmp/x-%d.pgm <file.pdf>`（72dpi 使 1px=1pt；PGM P5 头含 # 注释行需逐 token 跳过）；文本层用 `-sDEVICE=txtwrite`，过滤 `[ \t\r\n\x00-\x1f]` 后数码点。系统只有 gs，没有 pdftoppm
-```
+````
 
 - [ ] **Step 5: 最终提交**（计划文档已在计划定稿时提交，此处仅提交 CLAUDE.md）
 
