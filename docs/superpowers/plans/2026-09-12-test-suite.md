@@ -904,6 +904,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```rust
 //! Tok 内容流词法器单元测试
+#![allow(non_snake_case)]
+
 
 mod common;
 
