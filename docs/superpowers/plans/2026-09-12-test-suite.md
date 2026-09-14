@@ -1652,6 +1652,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```rust
 //! Walk 内容流遍历单元测试（墨迹 x 区间收集、Form/Image、文本定位、边界情形）
+#![allow(non_snake_case)]
+
 
 mod common;
 
