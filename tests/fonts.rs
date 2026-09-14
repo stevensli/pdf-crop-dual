@@ -214,9 +214,10 @@ fn resolve_font_id缓存与失败路径() {
     let mut fonts = HashMap::new();
     assert_eq!(resolve_font_id(&doc, Some(&res), b"F1", &mut fonts), Some(f));
     assert_eq!(fonts.len(), 1);
-    // 二次调用命中缓存，不重复解析
+    // 二次调用命中缓存，不重复解析：预置哨兵，调用后应被保留
+    *fonts.get_mut(&f).unwrap() = FontInfo::Unknown;
     assert_eq!(resolve_font_id(&doc, Some(&res), b"F1", &mut fonts), Some(f));
-    assert_eq!(fonts.len(), 1);
+    assert!(matches!(fonts.get(&f), Some(FontInfo::Unknown)));
     // 名称不存在
     assert_eq!(resolve_font_id(&doc, Some(&res), b"Nope", &mut fonts), None);
     // res 为 None
