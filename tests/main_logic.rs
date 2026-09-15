@@ -305,6 +305,23 @@ fn shift_path_op坐标平移() {
     assert_eq!(c2.operands[3], Object::Real(8.0));
     assert_eq!(c2.operands[5], Object::Real(9.0));
 
+    // v/y 坐标位：仅 (0,1)(2,3) 两对平移
+    let mut v = Operation::new(
+        "v",
+        vec![10.0.into(), 20.0.into(), 30.0.into(), 40.0.into()],
+    );
+    shift_path_op(&mut v, (-100.0, 5.0));
+    assert_eq!(v.operands[0], Object::Real(-90.0));
+    assert_eq!(v.operands[1], Object::Real(25.0));
+    assert_eq!(v.operands[2], Object::Real(-70.0));
+    assert_eq!(v.operands[3], Object::Real(45.0));
+    let mut y = Operation::new("y", vec![1.0.into(), 2.0.into(), 3.0.into(), 4.0.into()]);
+    shift_path_op(&mut y, (-10.0, 3.0));
+    assert_eq!(y.operands[0], Object::Real(-9.0));
+    assert_eq!(y.operands[1], Object::Real(5.0));
+    assert_eq!(y.operands[2], Object::Real(-7.0));
+    assert_eq!(y.operands[3], Object::Real(7.0));
+
     let mut d = Operation::new("Do", vec![10.0.into()]);
     shift_path_op(&mut d, w); // 未知操作符不变
     assert_eq!(d.operands[0], Object::Real(10.0));

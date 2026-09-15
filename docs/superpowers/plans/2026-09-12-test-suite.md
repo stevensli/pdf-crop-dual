@@ -1894,6 +1894,15 @@ fn v追加两点() {
     assert_eq!(iv, vec![(0.0, 30.0)]);
 }
 
+#[test]
+fn y追加两点() {
+    // y 臂（与 v 同索引 (0,1)(2,3)）：m(0,0) + y(10,100,20,200) → x∈(0,20)
+    // 回归（y 臂缺失）→ (0,0)；回归（索引行列互换 (0,2)(1,3)）→ (0,100)
+    let (doc, _) = doc_with_font();
+    let iv = walk(&doc, "0 0 m 10 100 20 200 y f", None);
+    assert_eq!(iv, vec![(0.0, 20.0)]);
+}
+
 // ===================== Form / Image XObject =====================
 
 #[test]
@@ -3254,6 +3263,23 @@ fn shift_path_op坐标平移() {
     assert_eq!(c2.operands[3], Object::Real(8.0));
     assert_eq!(c2.operands[5], Object::Real(9.0));
 
+    // v/y 坐标位：仅 (0,1)(2,3) 两对平移
+    let mut v = Operation::new(
+        "v",
+        vec![10.0.into(), 20.0.into(), 30.0.into(), 40.0.into()],
+    );
+    shift_path_op(&mut v, (-100.0, 5.0));
+    assert_eq!(v.operands[0], Object::Real(-90.0));
+    assert_eq!(v.operands[1], Object::Real(25.0));
+    assert_eq!(v.operands[2], Object::Real(-70.0));
+    assert_eq!(v.operands[3], Object::Real(45.0));
+    let mut y = Operation::new("y", vec![1.0.into(), 2.0.into(), 3.0.into(), 4.0.into()]);
+    shift_path_op(&mut y, (-10.0, 3.0));
+    assert_eq!(y.operands[0], Object::Real(-9.0));
+    assert_eq!(y.operands[1], Object::Real(5.0));
+    assert_eq!(y.operands[2], Object::Real(-7.0));
+    assert_eq!(y.operands[3], Object::Real(7.0));
+
     let mut d = Operation::new("Do", vec![10.0.into()]);
     shift_path_op(&mut d, w); // 未知操作符不变
     assert_eq!(d.operands[0], Object::Real(10.0));
@@ -3780,7 +3806,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - [ ] **Step 1: 全量测试**
 
 Run: `cargo test 2>&1 | grep -E "^test result|running" | tail -20`
-Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `9 passed; 1 ignored`，其文件共定义 10 个测试），合计 157 个测试（12+16+15+9+7+41+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
+Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `9 passed; 1 ignored`，其文件共定义 10 个测试），合计 158 个测试（12+16+15+9+7+42+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
 
 - [ ] **Step 2: 深检（全 74 页逐像素）**
 
