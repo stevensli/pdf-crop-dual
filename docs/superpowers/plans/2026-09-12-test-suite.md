@@ -1968,6 +1968,18 @@ fn Image按单位正方形量测() {
 }
 
 #[test]
+fn Image在ctm缩放下量测() {
+    // 单位正方形四角 ×(Matrix·ctm)：Matrix=[2,0,0,2,100,0]，ctm=2× → x∈(200,204)
+    // 回归（忽略 ctm）→ (100,102)；回归（组合顺序颠倒）→ (100,104)
+    let mut doc = Document::new();
+    let img = image_xobject(&mut doc, [2.0, 0.0, 0.0, 2.0, 100.0, 0.0]);
+    let res = page_resources(&[], &[(b"Im", img)]);
+    let res_id = doc.add_object(Object::Dictionary(res));
+    let iv = walk(&doc, "q 2 0 0 2 0 0 cm /Im Do Q", Some(res_of(&doc, res_id)));
+    assert_eq!(iv, vec![(200.0, 204.0)]);
+}
+
+#[test]
 fn 同一Form绘制两次只计一次() {
     // seen_forms 固化口径：重复 Do 不重复量测（并集不变，但区间数减半）
     let mut doc = Document::new();
@@ -3768,7 +3780,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - [ ] **Step 1: 全量测试**
 
 Run: `cargo test 2>&1 | grep -E "^test result|running" | tail -20`
-Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `9 passed; 1 ignored`，其文件共定义 10 个测试），合计 156 个测试（12+16+15+9+7+40+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
+Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `9 passed; 1 ignored`，其文件共定义 10 个测试），合计 157 个测试（12+16+15+9+7+41+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
 
 - [ ] **Step 2: 深检（全 74 页逐像素）**
 

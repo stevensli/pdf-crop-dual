@@ -305,6 +305,18 @@ fn Image按单位正方形量测() {
 }
 
 #[test]
+fn Image在ctm缩放下量测() {
+    // 单位正方形四角 ×(Matrix·ctm)：Matrix=[2,0,0,2,100,0]，ctm=2× → x∈(200,204)
+    // 回归（忽略 ctm）→ (100,102)；回归（组合顺序颠倒）→ (100,104)
+    let mut doc = Document::new();
+    let img = image_xobject(&mut doc, [2.0, 0.0, 0.0, 2.0, 100.0, 0.0]);
+    let res = page_resources(&[], &[(b"Im", img)]);
+    let res_id = doc.add_object(Object::Dictionary(res));
+    let iv = walk(&doc, "q 2 0 0 2 0 0 cm /Im Do Q", Some(res_of(&doc, res_id)));
+    assert_eq!(iv, vec![(200.0, 204.0)]);
+}
+
+#[test]
 fn 同一Form绘制两次只计一次() {
     // seen_forms 固化口径：重复 Do 不重复量测（并集不变，但区间数减半）
     let mut doc = Document::new();
