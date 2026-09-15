@@ -47,6 +47,27 @@ fn 左侧原样右侧左移() {
         ],
         "左原样右左移",
     );
+    // TJ 数组：范围 [650, 663]（'A'5 + (-200/1000)·10 + 'B'10 = 13pt）全右 →
+    // Tm 左移 100、数组原样重发（元素集 -200/A/B 被钉住）
+    let out = rewrite_page(
+        &doc,
+        b"BT /F1 10 Tf 1 0 0 1 650 500 Tm [(A) -200 (B)] TJ ET",
+        Some(res),
+        500.0,
+        100.0,
+    )
+    .expect("可重写");
+    assert_ops(
+        &out,
+        &[
+            eo("BT", vec![]),
+            ("Tf", vec![10.0], vec![], vec![b"F1".to_vec()]),
+            eo("Tm", vec![1.0, 0.0, 0.0, 1.0, 550.0, 500.0]),
+            ("TJ", vec![-200.0], vec![b"A".to_vec(), b"B".to_vec()], vec![]),
+            eo("ET", vec![]),
+        ],
+        "TJ 右侧左移",
+    );
 }
 
 #[test]
@@ -66,6 +87,27 @@ fn 右侧Tm原点仅取CTM逆修正() {
             eo("ET", vec![]),
         ],
         "右侧 Tm",
+    );
+    // 非单位 Tm 线性部分（2× 缩放）：修正仍只走 CTM 逆（ctm 单位 → de=-100）；
+    // 若误用 ptm 逆（det=4）得 de=-50 → 发射 600，打挂
+    let out = rewrite_page(
+        &doc,
+        b"BT /F1 10 Tf 2 0 0 2 650 500 Tm (A) Tj ET",
+        Some(res),
+        500.0,
+        100.0,
+    )
+    .expect("可重写");
+    assert_ops(
+        &out,
+        &[
+            eo("BT", vec![]),
+            ("Tf", vec![10.0], vec![], vec![b"F1".to_vec()]),
+            eo("Tm", vec![2.0, 0.0, 0.0, 2.0, 550.0, 500.0]),
+            ("Tj", vec![], vec![b"A".to_vec()], vec![]),
+            eo("ET", vec![]),
+        ],
+        "2x 缩放 Tm",
     );
 }
 
@@ -87,6 +129,29 @@ fn Td从左跨到右() {
             eo("ET", vec![]),
         ],
         "Td 左→右",
+    );
+    // 2× 缩放行矩阵：Td 偏移经线性部分（e' = 100 + 450·2 = 1000，右）；
+    // 修正走 ptm 逆：(-100·2/4, 0) = (-50, 0) → 发射 450 - 50 = 400；
+    // 若丢缩放当设备空间，e' = 550 落带内 → None，expect 打挂
+    let out = rewrite_page(
+        &doc,
+        b"BT /F1 10 Tf 2 0 0 2 100 500 Tm 450 0 Td (A) Tj ET",
+        Some(res),
+        500.0,
+        100.0,
+    )
+    .expect("可重写");
+    assert_ops(
+        &out,
+        &[
+            eo("BT", vec![]),
+            ("Tf", vec![10.0], vec![], vec![b"F1".to_vec()]),
+            eo("Tm", vec![2.0, 0.0, 0.0, 2.0, 100.0, 500.0]),
+            eo("Td", vec![400.0, 0.0]),
+            ("Tj", vec![], vec![b"A".to_vec()], vec![]),
+            eo("ET", vec![]),
+        ],
+        "2x 缩放 Td 跨带",
     );
 }
 
@@ -178,6 +243,46 @@ fn cm内路径按操作空间平移() {
             eo("Q", vec![]),
         ],
         "cm 包裹路径",
+    );
+    // 曲线 c：三对坐标（两控制点 + 端点）各 -100，钉住索引表 (0,1),(2,3),(4,5)
+    let out = rewrite_page(
+        &doc,
+        b"610 0 m 630 20 650 0 640 30 c 620 20 610 10 610 0 c f",
+        Some(res),
+        500.0,
+        100.0,
+    )
+    .expect("可重写");
+    assert_ops(
+        &out,
+        &[
+            eo("m", vec![510.0, 0.0]),
+            eo("c", vec![530.0, 20.0, 550.0, 0.0, 540.0, 30.0]),
+            eo("c", vec![520.0, 20.0, 510.0, 10.0, 510.0, 0.0]),
+            eo("f", vec![]),
+        ],
+        "c 曲线移位",
+    );
+    // 剪切 cm（b=1）：shift_vec = (-cut·d/det, cut·b/det) = (-100, 100)，
+    // 钉住 y 分量（此前所有路径用例 ctm.b=0，y 分量恒 0 无法行使）
+    let out = rewrite_page(
+        &doc,
+        b"q 1 1 0 1 0 0 cm 610 0 10 10 re f Q",
+        Some(res),
+        500.0,
+        100.0,
+    )
+    .expect("可重写");
+    assert_ops(
+        &out,
+        &[
+            eo("q", vec![]),
+            eo("cm", vec![1.0, 1.0, 0.0, 1.0, 0.0, 0.0]),
+            eo("re", vec![510.0, 100.0, 10.0, 10.0]),
+            eo("f", vec![]),
+            eo("Q", vec![]),
+        ],
+        "剪切 cm 路径",
     );
 }
 
@@ -460,6 +565,27 @@ fn Td同侧不变() {
             eo("ET", vec![]),
         ],
         "Td 同侧",
+    );
+    // LL 格：左→左（100→120）delta=0，Td 原样，闭合 2×2 侧转移矩阵
+    let out = rewrite_page(
+        &doc,
+        b"BT /F1 10 Tf 1 0 0 1 100 500 Tm 20 0 Td (A) Tj ET",
+        Some(res),
+        500.0,
+        100.0,
+    )
+    .expect("可重写");
+    assert_ops(
+        &out,
+        &[
+            eo("BT", vec![]),
+            ("Tf", vec![10.0], vec![], vec![b"F1".to_vec()]),
+            eo("Tm", vec![1.0, 0.0, 0.0, 1.0, 100.0, 500.0]),
+            eo("Td", vec![20.0, 0.0]),
+            ("Tj", vec![], vec![b"A".to_vec()], vec![]),
+            eo("ET", vec![]),
+        ],
+        "Td 左→左",
     );
 }
 
