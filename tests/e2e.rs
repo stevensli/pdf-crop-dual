@@ -159,8 +159,10 @@ fn cli_过宽收敛且超小宽度拒绝() {
 fn e2e_正常裁剪输出框() {
     let input = test_pdf();
     let out = tmp_file("out100.pdf");
-    let (code, _stdout, stderr) = run_tool(&[input.to_str().unwrap(), out.to_str().unwrap(), "100"]);
+    let (code, stdout, stderr) = run_tool(&[input.to_str().unwrap(), out.to_str().unwrap(), "100"]);
     assert_eq!(code, 0, "stderr: {stderr}");
+    // spec=100 < 最小空白 122.9pt → 不收敛（无提示），cut=100 → 新宽 908
+    assert!(!stdout.contains("提示"), "不应触发收敛提示: {stdout}");
     let doc = Document::load(&out).expect("加载输出 PDF");
     let pages = doc.get_pages();
     assert_eq!(pages.len(), 74);
@@ -168,6 +170,10 @@ fn e2e_正常裁剪输出框() {
         let d = doc.get_object(page_id).unwrap().as_dict().unwrap();
         let mb = get_mediabox(&doc, d, page_id).unwrap();
         assert_eq!(mb, vec![0.0, 0.0, 908.0, 661.5], "第 {num} 页 MediaBox");
+        // CropBox 夹具每页均存在，update_page_boxes 的「已存在则更新」分支真实行使
+        let cb = d.get(b"CropBox").unwrap().as_array().unwrap();
+        let cb: Vec<f32> = cb.iter().map(|o| o.as_float().unwrap()).collect();
+        assert_eq!(cb, vec![0.0, 0.0, 908.0, 661.5], "第 {num} 页 CropBox");
     }
 }
 
