@@ -2,8 +2,11 @@
 
 mod common;
 
-use common::{run_tool, tmp_file};
-use lopdf::{Document, Dictionary, Object, ObjectId};
+use common::{
+    count_text_codepoints, gs_available, page_resources, page_tree, render_pgm_page,
+    render_txt_file, render_txt_page, run_tool, tmp_file, type1_font,
+};
+use lopdf::{dictionary, Document, Dictionary, Object, ObjectId, Stream};
 use pdf_crop_dual::{detect_gap, get_mediabox, page_resources_dict, Walk};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -255,4 +258,160 @@ fn e2e_格式保留结构() {
     assert_eq!(n_fb, 3);
     let fb: Vec<u32> = (1..=74).filter(|n| gaps[(n - 1) as usize].is_none()).collect();
     assert_eq!(fb, vec![30, 48, 74]);
+}
+// ===================== gs 依赖测试（gs 缺失时跳过） =====================
+
+#[test]
+fn e2e_文本层1倍() {
+    if !gs_available() {
+        eprintln!("跳过 e2e_文本层：系统未安装 gs（ghostscript）");
+        return;
+    }
+    let input = test_pdf();
+    let out = tmp_file("out100txt.pdf");
+    let (code, _stdout, stderr) = run_tool(&[input.to_str().unwrap(), out.to_str().unwrap(), "100"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    // 总量 1×：每页内容在输出中恰好出现一次（gs 10.x txtwrite 无页分隔符，
+    // 故按总量断言；空白回退页贡献 0 码点，其 2× 不改变总量）
+    let o_cp = count_text_codepoints(&render_txt_file(input));
+    let n_cp = count_text_codepoints(&render_txt_file(&out));
+    assert_eq!(n_cp, o_cp, "输出文本层总量应 1×：{o_cp} → {n_cp}");
+    // 代表 gap 页逐页定位（页 1 纯双栏、页 6 语法高亮+路径装饰、页 46 MP 标记）
+    for page in [1u32, 6, 46] {
+        let o_cp = count_text_codepoints(&render_txt_page(input, page));
+        let n_cp = count_text_codepoints(&render_txt_page(&out, page));
+        assert_eq!(n_cp, o_cp, "第 {page} 页（gap）文本层应 1×：{o_cp} → {n_cp}");
+    }
+}
+
+/// 构造 1 页回退方案 PDF：内容横跨页面中线 → 无清晰空白 → 传统 clip 方案（文本层 2×）
+fn span_fallback_pdf() -> PathBuf {
+    let mut doc = Document::new();
+    // A-D @10pt = 10pt/字符；"ABCD" 宽 40pt，置于 x∈[80,120]，横跨中线 100
+    let f = type1_font(&mut doc, 65, &[1000.0; 4]);
+    let res = page_resources(&[(b"F1", f)], &[]);
+    let res_id = doc.add_object(Object::Dictionary(res));
+    let content_id = doc.add_object(Object::Stream(Stream::new(
+        dictionary! {},
+        b"BT /F1 10 Tf 80 50 Td (ABCD) Tj ET".to_vec(),
+    )));
+    let pd = dictionary! {
+        "Type" => "Page",
+        "MediaBox" => Object::Array(vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(200.0),
+            Object::Real(100.0),
+        ]),
+        "Resources" => Object::Reference(res_id),
+        "Contents" => Object::Reference(content_id),
+    };
+    let (_page_id, parent_id) = page_tree(&mut doc, pd, Dictionary::new());
+    // lopdf 无 set_pages：页树经 trailer Root → catalog Pages 定位
+    let catalog_id = doc.add_object(Object::Dictionary(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(parent_id),
+    }));
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+    let p = tmp_file("span-fallback.pdf");
+    doc.save(&p).expect("保存合成 PDF 失败");
+    p
+}
+
+#[test]
+fn e2e_回退页文本层2倍() {
+    if !gs_available() {
+        eprintln!("跳过 e2e_回退2倍：系统未安装 gs（ghostscript）");
+        return;
+    }
+    let input = span_fallback_pdf();
+    let out = tmp_file("span-out.pdf");
+    let (code, _stdout, stderr) = run_tool(&[input.to_str().unwrap(), out.to_str().unwrap(), "20"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    // 回退方案整页绘制两次（左右 clip），文本层 2×
+    let o_cp = count_text_codepoints(&render_txt_file(&input));
+    let n_cp = count_text_codepoints(&render_txt_file(&out));
+    assert_eq!(o_cp, 4, "合成页原始应 4 码点");
+    assert_eq!(n_cp, 2 * o_cp, "回退页文本层应 2×：{o_cp} → {n_cp}");
+}
+
+#[test]
+fn e2e_像素手工裁剪全等() {
+    if !gs_available() {
+        eprintln!("跳过 e2e_像素手工裁剪：系统未安装 gs（ghostscript）");
+        return;
+    }
+    let input = test_pdf();
+    let out = tmp_file("out100px.pdf");
+    let (code, _stdout, stderr) = run_tool(&[input.to_str().unwrap(), out.to_str().unwrap(), "100"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let gaps = page_gaps(&Document::load(input).expect("加载 test.pdf"));
+    const CUT: usize = 100;
+    // 代表页：1（纯双栏）、6/9（语法高亮+路径装饰+标记内容）、46（MP）、30/48/74（空白回退页）
+    for page in [1u32, 6, 9, 46, 30, 48, 74] {
+        let i = (page - 1) as usize;
+        // 移除带位置：与 main.rs rebuild_page 同公式
+        let band_left = if let Some((l, r)) = gaps[i] {
+            (l + r) / 2.0 - CUT as f32 / 2.0
+        } else {
+            (1008.0 - CUT as f32) / 2.0
+        };
+        let left_cols = band_left.ceil() as usize;
+        let o = render_pgm_page(input, page);
+        let n = render_pgm_page(&out, page);
+        assert_eq!(n.width, 1008 - CUT, "第 {page} 页输出宽");
+        assert_eq!(n, o.manual_crop(left_cols, CUT), "第 {page} 页应逐像素等于原始页手工裁剪");
+    }
+}
+
+#[test]
+fn e2e_墨迹范围左移() {
+    if !gs_available() {
+        eprintln!("跳过 e2e_墨迹范围：系统未安装 gs（ghostscript）");
+        return;
+    }
+    let input = test_pdf();
+    let out = tmp_file("out100dx.pdf");
+    let (code, _stdout, stderr) = run_tool(&[input.to_str().unwrap(), out.to_str().unwrap(), "100"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    for page in [1u32, 6, 9, 46, 30, 48, 74] {
+        let o = render_pgm_page(input, page);
+        let n = render_pgm_page(&out, page);
+        assert_eq!(n.width, 908, "第 {page} 页输出宽");
+        match (o.dark_cols(), n.dark_cols()) {
+            (Some((omn, omx)), Some((nmin, nmax))) => {
+                assert_eq!(omn, nmin, "第 {page} 页左缘应不变");
+                assert_eq!(omx, nmax + 100, "第 {page} 页右缘应左移 100px");
+            }
+            (None, None) => {} // 无墨迹页（空白回退页）
+            (a, b) => panic!("第 {page} 页墨迹缺失: 原始 {a:?} 输出 {b:?}"),
+        }
+    }
+}
+
+#[test]
+#[ignore = "全 74 页逐像素深检较慢（约 2~5 分钟），手动运行: cargo test --test e2e -- --ignored"]
+fn e2e_全部页像素全等() {
+    if !gs_available() {
+        eprintln!("跳过 e2e_全部页像素全等：系统未安装 gs（ghostscript）");
+        return;
+    }
+    let input = test_pdf();
+    let out = tmp_file("out100all.pdf");
+    let (code, _stdout, stderr) = run_tool(&[input.to_str().unwrap(), out.to_str().unwrap(), "100"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let gaps = page_gaps(&Document::load(input).expect("加载 test.pdf"));
+    const CUT: usize = 100;
+    for page in 1..=74u32 {
+        let i = (page - 1) as usize;
+        let band_left = if let Some((l, r)) = gaps[i] {
+            (l + r) / 2.0 - CUT as f32 / 2.0
+        } else {
+            (1008.0 - CUT as f32) / 2.0
+        };
+        let left_cols = band_left.ceil() as usize;
+        let o = render_pgm_page(input, page);
+        let n = render_pgm_page(&out, page);
+        assert_eq!(n, o.manual_crop(left_cols, CUT), "第 {page} 页像素应全等于手工裁剪");
+    }
 }
