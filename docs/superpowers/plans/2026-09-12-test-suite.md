@@ -1784,6 +1784,41 @@ fn Tz仅对空格生效() {
 }
 
 #[test]
+fn 双引号先应用TwTc再换行显示() {
+    // " (aw, ac, s)：先设 tw/tc 再换行显示（x 保持行首）；A=6, 空格=8, B=11 → 25
+    // 回归（忽略 aw/ac）→ 20 → (100,120)
+    let (doc, res_id) = doc_with_font();
+    let iv = walk(&doc, "BT /F1 10 Tf 100 500 Td 2 1 (A B) \" ET", Some(res_of(&doc, res_id)));
+    assert_eq!(iv, vec![(100.0, 125.0)]);
+}
+
+#[test]
+fn 单引号换行显示用当前TwTc() {
+    // ' 取显示时刻的当前 tw/tc；回归（忽略 Tw/Tc）→ 20 → (100,120)
+    let (doc, res_id) = doc_with_font();
+    let iv = walk(&doc, "BT /F1 10 Tf 2 Tw 1 Tc 100 500 Td (A B) ' ET", Some(res_of(&doc, res_id)));
+    assert_eq!(iv, vec![(100.0, 125.0)]);
+}
+
+#[test]
+fn 星号换行x仍从行首起() {
+    // T* 仅下移一行，x 保持行首；两行均 AB=15
+    // 回归（T* 带 x 位移）→ 第二行始于 115 → (115,130)
+    let (doc, res_id) = doc_with_font();
+    let iv = walk(&doc, "BT /F1 10 Tf 12 TL 100 500 Td (AB) Tj T* (AB) Tj ET", Some(res_of(&doc, res_id)));
+    assert_eq!(iv, vec![(100.0, 115.0), (100.0, 115.0)]);
+}
+
+#[test]
+fn TD含x分量相对定位() {
+    // TD(tx,ty)：行起点移动 (tx,ty) 并同时设 TL=-ty；x=100+10=110
+    // 回归（TD 被忽略）→ (100,105)
+    let (doc, res_id) = doc_with_font();
+    let iv = walk(&doc, "BT /F1 10 Tf 100 500 Td 10 -12 TD (A) Tj ET", Some(res_of(&doc, res_id)));
+    assert_eq!(iv, vec![(110.0, 115.0)]);
+}
+
+#[test]
 fn BT外的文本操作被忽略() {
     // 第二个 BT 块验证 BT 重置 tlm：不继承第一块行矩阵（e 回到 200 而非叠加到 300）
     let (doc, res_id) = doc_with_font();
@@ -1905,6 +1940,21 @@ fn Form内文本用自身字体() {
     let iv = walk(&doc, "/Fl Do", Some(res_of(&doc, res_id)));
     // x0 = 500 + 10 = 510，advance = 5 + 10 = 15
     assert_eq!(iv, vec![(510.0, 525.0)]);
+}
+
+#[test]
+fn Form内qQ平衡的cm不外泄() {
+    // Form 内 q/Q 包住的 cm(e=500) 在 Do 后复原；页面文本仍从 x=100 起
+    // 回归（cm 外泄）→ 文本 x0=600 → (600,605)
+    let mut doc = Document::new();
+    let mut widths = vec![0.0f32; 35];
+    widths[33] = 500.0; // 'A'
+    let f = type1_font(&mut doc, 32, &widths);
+    let fm = form_xobject(&mut doc, b"q 1 0 0 1 500 0 cm 0 0 10 10 re f Q", None, None, None);
+    let res = page_resources(&[(b"F1", f)], &[(b"Fm", fm)]);
+    let res_id = doc.add_object(Object::Dictionary(res));
+    let iv = walk(&doc, "/Fm Do BT /F1 10 Tf 100 500 Td (A) Tj ET", Some(res_of(&doc, res_id)));
+    assert_eq!(iv, vec![(500.0, 510.0), (100.0, 105.0)]);
 }
 
 #[test]
@@ -3718,7 +3768,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - [ ] **Step 1: 全量测试**
 
 Run: `cargo test 2>&1 | grep -E "^test result|running" | tail -20`
-Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `9 passed; 1 ignored`，其文件共定义 10 个测试），合计 151 个测试（12+16+15+9+7+35+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
+Expected：所有 test binary 均 `test result: ok. N passed; 0 failed`（e2e 为 `9 passed; 1 ignored`，其文件共定义 10 个测试），合计 156 个测试（12+16+15+9+7+40+31+16+10），总耗时约 1~3 分钟。任何失败：先修测试（断言口径错）或修 src（真 bug），再重跑。
 
 - [ ] **Step 2: 深检（全 74 页逐像素）**
 
