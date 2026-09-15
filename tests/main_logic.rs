@@ -53,13 +53,16 @@ fn compute_cut_spec过小报错() {
     let gaps: Vec<Option<(f32, f32)>> = vec![None, None];
     let e = compute_cut(&gaps, 0.5).unwrap_err();
     assert!(e.contains("空白宽度必须大于 1 pt"), "{e}");
+    // 边界：cut == 1.0 仍须 Err（钉住 <= 而非 <）
+    assert!(compute_cut(&gaps, 1.0).is_err());
 }
 
 #[test]
 fn compute_cut最小空白过窄报错() {
     // 检测到空白 (100, 100.5) → min=0.5 → cut=min(spec,0.5) <= 1 → Err
     let gaps = vec![Some((100.0, 100.5))];
-    assert!(compute_cut(&gaps, 5.0).is_err());
+    let e = compute_cut(&gaps, 5.0).unwrap_err();
+    assert!(e.contains("空白宽度必须大于 1 pt"), "{e}");
 }
 
 // ===================== build_form_stream =====================
@@ -243,6 +246,7 @@ fn val_to_obj转换() {
         Object::Array(items) => {
             assert_eq!(items.len(), 2);
             assert_eq!(items[0], Object::Real(1.0));
+            assert_eq!(items[1], Object::String(b"x".to_vec(), StringFormat::Literal));
         }
         other => panic!("期望 Array，实际: {other:?}"),
     }
@@ -286,6 +290,20 @@ fn shift_path_op坐标平移() {
     assert_eq!(c.operands[0], Object::Real(-100.0));
     assert_eq!(c.operands[2], Object::Real(-99.0));
     assert_eq!(c.operands[4], Object::Real(-98.0));
+
+    // y 分量非零行使：l 的 (0,1) 对 + c 的 y 索引 (1,3,5)
+    let mut l = Operation::new("l", vec![5.0.into(), 5.0.into()]);
+    shift_path_op(&mut l, (-3.0, 7.0));
+    assert_eq!(l.operands[0], Object::Real(2.0));
+    assert_eq!(l.operands[1], Object::Real(12.0)); // 钉住 y 分量 *v += w.1
+    let mut c2 = Operation::new(
+        "c",
+        vec![0.0.into(), 0.0.into(), 1.0.into(), 1.0.into(), 2.0.into(), 2.0.into()],
+    );
+    shift_path_op(&mut c2, (-3.0, 7.0));
+    assert_eq!(c2.operands[1], Object::Real(7.0));
+    assert_eq!(c2.operands[3], Object::Real(8.0));
+    assert_eq!(c2.operands[5], Object::Real(9.0));
 
     let mut d = Operation::new("Do", vec![10.0.into()]);
     shift_path_op(&mut d, w); // 未知操作符不变
