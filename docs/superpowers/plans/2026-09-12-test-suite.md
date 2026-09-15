@@ -1838,11 +1838,11 @@ fn qQ恢复图形状态() {
 }
 
 #[test]
-fn m重置路径仅保留最后子路径() {
-    // Walk 已知口径：m 替换而非累积子路径
+fn m累积多子路径共享终结() {
+    // Walk 口径：m 追加新子路径起点，绘制终结汇总全部子路径点集（与重写器多子路径累积一致）
     let (doc, _) = doc_with_font();
     let iv = walk(&doc, "0 0 m 10 0 l 20 0 m 30 0 l S", None);
-    assert_eq!(iv, vec![(20.0, 30.0)]);
+    assert_eq!(iv, vec![(0.0, 30.0)]);
 }
 
 #[test]

@@ -987,7 +987,7 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// 路径：re/m/l/c/v/y 构造，绘制操作汇总区间，W|W*|n 丢弃
+    /// 路径：m/re 追加子路径、l/c/v/y 追加点，绘制终结汇总全部子路径点集后清空，W|W*|n 丢弃
     fn exec_path(&mut self, op: &str, args: &[Val]) {
         match op {
             "re" => {
@@ -997,12 +997,12 @@ impl<'a> Walk<'a> {
                     Self::num(args, 2),
                     Self::num(args, 3),
                 ) {
-                    self.path = vec![(x, y), (x + w, y), (x + w, y + h), (x, y + h)];
+                    self.path.extend([(x, y), (x + w, y), (x + w, y + h), (x, y + h)]);
                 }
             }
             "m" => {
                 if let (Some(x), Some(y)) = (Self::num(args, 0), Self::num(args, 1)) {
-                    self.path = vec![(x, y)];
+                    self.path.push((x, y));
                 }
             }
             "l" => {
