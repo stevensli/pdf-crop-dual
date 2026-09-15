@@ -15,25 +15,20 @@ cargo run -- <输入.pdf> <输出.pdf> <中间空白宽度(pt)>
 
 - `test.pdf` 是测试文件：74 页，页面 1008×661.5pt，每页由两个 504pt 的 Form XObject 组成（左栏英文、右栏中文，右栏经 `Matrix [1 0 0 1 504 0]` 定位）；第 30/48/74 页为空白页（无空白检测→传统方案）；左栏内容约 [72, 432]，右栏约 [566/576, 935–944]，真实空白带约 123–140pt
 - 部分页的**页面级**内容流不止两个 `Do`，还含直接绘制的内容（重写器必须全部支持，见「第二遍」节）：语法高亮代码文本块（`Tf/Td/Tm/Tj` 混用 + 块内 `rg`/`g` 颜色操作、第 6/9 页块内还有 `i` 平坦度）、小路径装饰（圆形/数字字形，`m/l/c/h/f/S` + 嵌套 `q cm … cm … Q`）、`/TouchUp_TextEdit MP` 标记内容（第 6/9/46 页）
-- 没有测试框架，修改后的验证方法见下节
+- 测试套件见「测试与验证」节（tests/ 目录，`cargo test` 一键运行）
 
-## 输出验证方法（像素级 + 文本层）
+## 测试与验证
 
-项目无单元测试。验证流程：
+测试全部位于 `tests/` 目录（src/ 内不含测试代码；测试所需的 lib 私有项已加 `pub`，main.rs 的 5 个纯函数已迁入 lib）：
 
 ```bash
-# 72dpi 渲染使 1px=1pt；pgmraw 输出 P5 原始格式，纯 Python 可直接解析（系统无 PIL/numpy）
-# 注意 PGM 头含 # 注释行，解析要逐 token 跳过
-gs -dNOPAUSE -dBATCH -sDEVICE=pgmraw -r72 -sOutputFile=/tmp/x-%d.pgm <file.pdf>
+cargo test                  # 全量：单元测试 + 集成测试（约 1~3 分钟）
+cargo test -- --ignored     # 追加 e2e 全 74 页逐像素深检（约 2~5 分钟）
 ```
 
-- **像素比对**：逐页比较暗像素（灰度 < 200）的 min/max——左栏范围应不变，右栏应整体左移 cut、左右缘不丢 1pt 以上。验证「重写方案渲染 == 传统方案渲染」时，新旧两个二进制的输出须**逐像素完全相同**（空白带内无墨迹、两侧墨迹离 band_left ≥2pt 无抗锯齿交互，任何 1px 差异即 bug）
-- **文本层 1× 检查**（验证内容未重复、格式保留有效）：
-  ```bash
-  gs -dNOPAUSE -dBATCH -sDEVICE=txtwrite -sOutputFile=/tmp/x.txt <file.pdf>
-  ```
-  纯 Python 过滤 `[ \t\r\n\x00-\x1f]` 后数 UTF-8 码点，输出总数应等于原始 PDF（恰好 1×；传统方案的输出是 2×）。逐页比对（`gs -dFirstPage=N -dLastPage=N`）可定位问题页
-- 系统只有 gs，没有 pdftoppm
+- 单元测试：`geometry.rs`（矩阵/裁剪）、`lexer.rs`（词法器）、`fonts.rs`（字体宽度与 advance）、`object_access.rs`（MediaBox/Resources 解析）、`detect_gap.rs`（空白判定）、`walk.rs`（Walk 墨迹区间口径）、`rewrite.rs`（重写器分类/移位/回退）、`main_logic.rs`（收敛算法/传统方案内容流/页面框）
+- 集成测试 `e2e.rs`：CLI 参数与收敛行为、输出页框、格式保留结构（gap 页不新增 XObject、回退页 2 个 Do + 裁剪在 cm 之前）、gs 文本层 1×/2×、gs 像素级「输出 == 原始页手工裁剪」全等；gs 缺失时 gs 依赖项自动跳过
+- 手工验证（调试用）：`gs -dNOPAUSE -dBATCH -sDEVICE=pgmraw -r72 -sOutputFile=/tmp/x-%d.pgm <file.pdf>`（72dpi 使 1px=1pt；PGM P5 头含 # 注释行需逐 token 跳过）；文本层用 `-sDEVICE=txtwrite`，过滤 `[ \t\r\n\x00-\x1f]` 后数码点。系统只有 gs，没有 pdftoppm
 
 ## 架构（src/main.rs 约 380 行 + src/lib.rs 约 2100 行）
 
